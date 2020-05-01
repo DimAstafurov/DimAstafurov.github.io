@@ -1,0 +1,250 @@
+/* Fonts */
+@font-face {
+    font-family: 'ProximaNova_regular';
+    src: url('../fonts/ProximaNova-Regular.eot');
+    src: url('../fonts/ProximaNova-Regular.eot?#iefix') format('embedded-opentype'),
+        url('../fonts/ProximaNova-Regular.woff2') format('woff2'),
+        url('../fonts/ProximaNova-Regular.woff') format('woff'),
+        url('../fonts/ProximaNova-Regular.ttf') format('truetype'),
+        url('../fonts/ProximaNova-Regular.svg#ProximaNova-Regular') format('svg');
+    font-weight: normal;
+    font-style: normal;
+}
+
+@font-face {
+    font-family: 'ProximaNova_bold';
+    src: url('../fonts/ProximaNova-Bold.eot');
+    src: url('../fonts/ProximaNova-Bold.eot?#iefix') format('embedded-opentype'),
+        url('../fonts/ProximaNova-Bold.woff2') format('woff2'),
+        url('../fonts/ProximaNova-Bold.woff') format('woff'),
+        url('../fonts/ProximaNova-Bold.ttf') format('truetype'),
+        url('../fonts/ProximaNova-Bold.svg#ProximaNova-Bold') format('svg');
+    font-weight: bold;
+    font-style: normal;
+}
+
+.reg () {
+	font-family: 'ProximaNova_regular', sans-serif;
+}
+.bold () {
+	font-family: 'ProximaNova_bold', sans-serif;
+}
+
+/* Colors*/
+@btn-color : #fcb303;
+@icon-color : #46b814;
+@text : #1a1820;
+@danger : #ff0000;
+@bg-light: #f5f5f5;
+@light: #fff;
+@border-input: #dddddd;
+
+/*Basic settings */
+html {
+	font-size: 10px;
+}
+
+body {
+	.reg();
+}
+
+.button {
+	.reg();
+	font-size: 1.2rem;
+	padding: 1rem 3rem;
+	border-radius: 8px;
+	border: none;
+	background-color: @btn-color;
+	color: @light;
+	text-transform: uppercase;
+	transition: all 0.2s;
+	&:hover {
+		cursor: pointer;
+		background-color: darken(@btn-color, 7%);
+	}
+}
+
+a:hover {
+	text-decoration: none;
+	color: @btn-color;
+}
+
+
+button, a, input {
+	&:focus {
+		outline: none;
+	}
+}
+
+/* Typography */
+section {
+	padding: 10rem 0;
+}
+
+/* Main */
+.main {
+	padding: 3rem;
+	background: #fff url(../img/main-img.jpg) center center no-repeat;
+	background-size: cover;
+	&-content {
+		margin-top: 7rem;
+
+		h1 {
+			margin-top: 0;
+			margin-bottom: 4rem;
+			.bold();
+			font-size: 4rem;
+			text-transform: uppercase;
+			line-height: 1.45;
+			color: @light;
+		}
+	}
+	&-subtitle {
+		margin-bottom: 4rem;
+		font-size: 2.4rem;
+		color: @light;
+
+	}
+	span {
+		display: inline-block;
+		padding: 2rem 5rem;
+		background-color: @icon-color;
+		font-size: 1.8rem;
+		color: @light;
+		text-align: center;
+		strong {
+			.bold();
+			font-size: 3rem;
+		}
+	}
+	&-trigger {
+		display: block;
+		.bold();
+		font-size: 2.2rem;
+		text-transform: uppercase;
+		margin-top: 3rem;
+		color: @light;
+	}
+	&-form {
+		display: block;
+		padding: 4rem 4rem;
+		background-color: @light;
+		text-align: center;
+		border-radius: 1rem;
+		&-header {
+			font-size: 1.8rem;
+			margin-bottom: 4rem;
+			strong {
+				font-size: 1.9rem;
+			}
+		}
+		&-input {
+			display: block;
+			border: 1px solid @border-input;
+			width: 100%;
+			padding: 1.5rem;
+			margin: 2rem 0rem;
+			font-size: 1.2rem;
+		}
+		label {
+			background-color: @light;
+			position: absolute;
+			left: 50%;
+			transform: translateX(-50%) translateY(-50%);
+			font-size: 1.3rem;
+		}
+		&-button {
+			display: block;
+			height: 5.5rem;
+			width: 100%;
+			font-size: 1.3rem;
+		}
+		small {
+			display: block;
+			margin-top: 1.5rem;
+			font-size: 1.2rem;
+		}
+
+	}
+}
+
+
+.logo {
+
+	&-img {
+		height: 5rem;
+	}
+}
+
+
+.ph-num {
+	padding: 0px 0px;
+	text-align: center;
+}
+
+.phone-link {
+	display: inline-block;
+	.bold();
+	font-size: 2rem;
+	height: 7rem;
+	line-height: 7rem;
+	color: @light;
+}
+
+.wrap {
+	display: table;
+	width: 100%;
+	height: 7rem;
+	&-block {
+		display: table-cell;
+		vertical-align: middle;
+		padding: 0;
+
+	}
+}
+ 
+ @media (max-width: 991px) {
+ 	.main {
+ 		background-position: top right;
+ 	}
+ 	.logo-img {
+ 		height: 4rem;
+ 	}
+ 	.phone-link {
+ 		font-size: 1.6rem;
+ 	}
+ 	.header-btn {
+ 		width: 100%;
+ 		font-size: 1rem;
+ 	}
+ 	.main-content {
+ 		margin-top: 3rem;
+ 	}
+ 	.main-title {
+ 		text-align: center;
+ 		margin-bottom: 3rem;
+ 	}
+ }
+  @media (max-width: 767px) {
+ 	.logo-img {
+ 		height: 7rem;
+ 	}
+ 	.phone-link {
+ 		font-size: 2.1rem;
+ 	}
+ 	.header-btn {
+ 		width: auto;
+ 		font-size: 1.5rem;
+ 	}
+ 	.main-title {
+ 		h1 {
+ 			font-size: 2.5rem;
+ 		}
+ 	}
+ 	.main-subtitle {
+ 		font-size: 1.8rem;
+ 	}
+ }
+
+ 
+
