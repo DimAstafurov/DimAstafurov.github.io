@@ -235,3 +235,8 @@ section {
     font-size: 1.8rem;
   }
 }
+
+ @media (max-width: 400px) {
+ 	min-width: 120%;
+ }
+
