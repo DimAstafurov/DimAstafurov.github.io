@@ -18,7 +18,7 @@
 html {
   font-size: 10px;
   width: 100%;
-
+overflow-x: hidden !important;
 }
 body {
   font-family: 'ProximaNova_regular', sans-serif;
@@ -65,7 +65,6 @@ section {
 .main {
   padding: 3rem;
   background: #ffffff url(../img/main-img.jpg) center center no-repeat;
-  background-size: cover;
   background-width: 100%;
   left: 0;
   right: 0;
