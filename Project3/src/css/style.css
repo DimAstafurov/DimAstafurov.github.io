@@ -20,6 +20,10 @@ html {
 }
 body {
   font-family: 'ProximaNova_regular', sans-serif;
+  -webkit-transform-style: preserve-3d;
+          transform-style: preserve-3d;
+  overflow-y: scroll;
+  overflow-x: hidden;
 }
 .button {
   font-family: 'ProximaNova_regular', sans-serif;
@@ -49,6 +53,12 @@ input:focus {
 /* Typography */
 section {
   padding: 10rem 0;
+}
+.section-header {
+  margin: 2rem 0 10rem;
+  font-family: 'ProximaNova_bold', sans-serif;
+  font-size: 3.6rem;
+  text-align: center;
 }
 /* Main */
 .main {
@@ -158,6 +168,32 @@ section {
   display: table-cell;
   vertical-align: middle;
   padding: 0;
+}
+/* Преимущества */
+.features-block {
+  text-align: center;
+}
+.features-block h3 {
+  font-family: 'ProximaNova_bold', sans-serif;
+  font-size: 2rem;
+  margin-bottom: 2rem;
+}
+.features-block p {
+  display: inline-block;
+  width: 90%;
+  font-size: 1.6rem;
+}
+.features-img {
+  height: 13rem;
+}
+.features-img img {
+  display: block;
+  margin: 0 auto;
+  height: 10rem;
+  text-align: center;
+}
+.slick-active {
+  outline: none;
 }
 @media (max-width: 991px) {
   .main {
