@@ -17,12 +17,15 @@
 /*Basic settings */
 html {
   font-size: 10px;
+  width: 100%;
+  margin: 0;
+  overflow-x: hidden !important;
 }
 body {
   font-family: 'ProximaNova_regular', sans-serif;
   width: 100%;
-	margin: 0;
-	overflow-x: hidden !important;
+  margin: 0;
+  overflow-x: hidden !important;
 }
 .button {
   font-family: 'ProximaNova_regular', sans-serif;
@@ -64,6 +67,10 @@ section {
   padding: 3rem;
   background: #ffffff url(../img/main-img.jpg) center center no-repeat;
   background-size: cover;
+  left: 0;
+  right: 0;
+  top: 0;
+  bottom: 0;
 }
 .main-content {
   margin-top: 7rem;
@@ -234,8 +241,6 @@ section {
     font-size: 1.8rem;
   }
 }
-
- @media (max-width: 400px) {
- 	min-width: 120%;
- }
-
+@media (max-width: 400px) {
+  min-width: 120%;
+}
