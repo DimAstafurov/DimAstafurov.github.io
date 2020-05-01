@@ -18,7 +18,7 @@
 html {
   font-size: 10px;
   width: 100%;
-  margin: 0;
+  margin-right: -1rem;
   overflow-x: hidden !important;
 }
 body {
