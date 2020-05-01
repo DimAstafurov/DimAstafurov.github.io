@@ -75,8 +75,76 @@
 				</div>
 			</div>
 		</main>
+
+		<section class="features">
+			<div class="container">
+				<h2 class="section-header">
+					Преимущества работы с нами
+				</h2>
+				<div class="features-slider">
+					<div class="features-block">
+						<div class="features-img"><img src="img/feature.png" alt="Платите по факту"></div>
+						<h3>Платите по факту</h3>
+						<p>Вы оплачиваете выполненные работы по факту. Никаких скрытых доплат и промежуточных платежей.</p>
+					</div>
+					<div class="features-block">
+						<div class="features-img"><img src="img/feature.png" alt=""></div>
+						<h3>Заключаем договор</h3>
+						<p>Вы оплачиваете выполненные работы по факту. Никаких скрытых доплат и промежуточных платежей.</p>
+					</div>
+					<div class="features-block">
+						<div class="features-img"><img src="img/feature.png" alt=""></div>
+						<h3>Точно в срок</h3>
+						<p>Вы оплачиваете выполненные работы по факту. Никаких скрытых доплат и промежуточных платежей.</p>
+					</div>
+					<div class="features-block">
+						<div class="features-img"><img src="img/feature.png" alt=""></div>
+						<h3>Экономьте на материалах</h3>
+						<p>Вы оплачиваете выполненные работы по факту. Никаких скрытых доплат и промежуточных платежей.</p>
+					</div>
+				</div>	
+			</div>
+		</section>
 		
 		<script src="https://code.jquery.com/jquery-3.4.1.slim.min.js" integrity="sha384-J6qa4849blE2+poT4WnyKhv5vZF5SrPo0iEjwBvKU7imGFAV0wwj1yYfoRSJoZ+n" crossorigin="anonymous"></script>
 		
+		<link rel="stylesheet" href="slick/slick.css">
+		<link rel="stylesheet" href="slick/slick-theme.css">
+		<script src="slick/slick.min.js"></script>
+		<script>
+			$(document).ready(function(){
+				$('.features-slider').slick({
+			    	infinite: true,
+					infinite: true,
+					slidesToShow: 4,
+					slidesToScroll: 1,
+					autoplay: true,
+			  	    autoplaySpeed: 2000,
+					responsive: [
+					  {
+					    breakpoint: 992,
+					    settings: {
+					      slidesToShow: 2,
+					      slidesToScroll: 2
+					    }
+					  },
+					  {
+					    breakpoint: 767,
+					    settings: {
+					      slidesToShow: 1,
+					      slidesToScroll: 1
+					    }
+					  }
+					  // You can unslick at a given breakpoint now by adding:
+					  // settings: "unslick"
+					  // instead of a settings object
+					]
+
+			  	});
+			  	$('.autoplay').slick({
+			  	  
+			  	});
+			});
+		</script>
 	</body>
 </html>
