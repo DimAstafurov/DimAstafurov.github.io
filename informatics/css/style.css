@@ -1,0 +1,48 @@
+.navlogo {
+	height: 40px;
+	padding-top: 0.7rem;
+	padding-right: 0.5rem;
+}
+
+.navbar-brand {
+	font-weight: 600;
+	text-transform: uppercase;
+}
+
+.navbar-collapse {
+	margin-left: 2rem;
+}
+
+.index-section {
+	height: 100vh;
+	background: url(../img/3bbaac1a60be20aaffbbab1539f51b26.jpg) no-repeat;
+	background-size: cover;
+}
+
+
+.main-clinics {
+	position: absolute;
+	top: 50%;
+	left: 50%;
+	transform: translate(-50%, -50%);
+	padding: 2rem 3rem;
+	background-color: white;
+}
+
+.clinics-name {
+	padding-bottom: 2rem;
+	font-size: 70px;
+	color: hsl(197, 84%, 40%)
+}
+
+
+
+
+.info-section {
+	margin-top: 4rem;
+}
+
+.info-header {
+	padding-top: 3rem;
+	padding-bottom: 2rem;
+}
