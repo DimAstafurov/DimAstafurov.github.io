@@ -1,432 +1,371 @@
 // vs-helper.js
-// ======================================================
-// Работает на mis.ctcloud.ru (page context).
-// 1) Перехватывает XHR, чтобы:
-//    - вытащить Authorization Bearer токен;
-//    - увидеть JSON форм /api/SubjectsForm/... (ЖВП).
-// 2) Через fetch (с этим же токеном) подгружает:
-//    - данные текущего визита;
-//    - список всех визитов субъекта;
-//    - формы ЖВП по предыдущим завершенным визитам.
-// 3) Строит историю значений по каждому fieldKey.
-// 4) Под каждым подходящим <input> показывает
-//    последнюю запись и кнопку "История" с попапом.
-// 5) Отслеживает смену URL в SPA (pushState/replaceState/popstate)
-//    и переинициализируется при переходе на другой визит.
-// ======================================================
+// ===============================================================
+// Клиентский помощник для формы "Жизненно-важные показатели" (VS)
+// ---------------------------------------------------------------
+// - Перехватывает XHR, чтобы:
+//   * вытащить токен Authorization (Bearer ...)
+//   * вытащить список визитов субъекта (Subjects/{id})
+// - По этим данным:
+//   * находит предыдущие визиты текущего субъекта
+//   * загружает по ним формы "Жизненно-важные показатели"
+//   * собирает историю измерений по полям (SAD, DAD, HR и т.д.)
+// - В DOM:
+//   * ищет инпуты с соответствующими fieldKey (по data-annotation-key / name)
+//   * под каждым инпутом показывает последнюю (предыдущую) величину
+//   * даёт кнопку "История" с раскрывающимся списком всех прошлых значений
+//
+// Важно:
+//   - Никаких запросов через сервер-прокси — всё из клиента, к тому же origin.
+//   - URL у формы визита не меняется между секциями, поэтому нужен MutationObserver,
+//     а также отслеживание history.pushState/replaceState + периодический опрос.
+//
+// Логи ищем в консоли по префиксу: [VS Helper]
+// ===============================================================
 
-(() => {
+(function () {
   "use strict";
 
-  if (window.__VS_HELPER_INITIALIZED__) return;
-  window.__VS_HELPER_INITIALIZED__ = true;
-
-  if (location.hostname !== "mis.ctcloud.ru") return;
-
   const logPrefix = "[VS Helper]";
-  const DEBUG = true;
+  const VS_FORM_TYPE_KEY = "VS";
 
-  function log(...args) {
-    if (!DEBUG) return;
-    console.log(logPrefix, ...args);
-  }
-
-  // ------------------------------------------------------
-  // 1. Глобальное состояние
-  // ------------------------------------------------------
-
-  /** Последний увиденный Authorization: Bearer ... */
+  /** Токен авторизации (значение заголовка Authorization) */
   let authHeaderValue = null;
-  /** Колбэки, которые ждут появления authHeaderValue */
-  const authReadyCallbacks = [];
 
-  /** 
-   * subjectId -> массив визитов:
-   * [{ subjectVisitId, title, date, index, formCompletedStatus }, ...]
+  /**
+   * subjectIdByVisitId:
+   *   ключ: subjectVisitId (GUID визита субъекта)
+   *   значение: subjectId (GUID субъекта)
    */
-  const visitsBySubjectId = new Map();
-
-  /** subjectVisitId -> subjectId */
   const subjectIdByVisitId = new Map();
 
   /**
-   * История по субъекту:
-   * subjectId -> { [fieldKey]: MeasurementEntry[] }
+   * visitsBySubjectId:
+   *   ключ: subjectId
+   *   значение: массив визитов субъекта:
+   *   {
+   *     subjectVisitId: string,
+   *     title: string,
+   *     date: string | null (ISO),
+   *     formCompletedStatus: string
+   *   }
    */
-  const vsHistoryBySubjectId = new Map();
+  const visitsBySubjectId = new Map();
 
-  /** Для каких subjectId уже пытались загрузить прошлые визиты */
+  /**
+   * measurementHistory:
+   *   ключ: subjectId
+   *   значение: объект { [fieldKey: string]: Array<HistoryEntry> }
+   *
+   * HistoryEntry:
+   *  {
+   *    fieldKey: string,
+   *    value: string | number,
+   *    visitId: string | null,
+   *    visitTitle: string,
+   *    sectionTitle: string,
+   *    timePoint: string | null,
+   *    visitDate: string | null
+   *  }
+   */
+  const measurementHistory = new Map();
+
+  /**
+   * previousVsLoadedForSubject:
+   *   множество subjectId, для которых мы уже один раз сходили
+   *   за предыдущими визитами и VS-формами.
+   */
   const previousVsLoadedForSubject = new Set();
 
-  /** Последний известный subjectVisitId (для трекинга смены URL) */
-  let currentVisitIdCache = null;
+  /** Для деконфликта многократных перезапусков скана DOM */
+  let scanScheduled = false;
 
-  // ------------------------------------------------------
-  // 2. Утилиты
-  // ------------------------------------------------------
+  /** Для отслеживания смены URL (SPA-навигация) */
+  let lastLocationHref = location.href;
+
+  // ---------------------------------------------------------------
+  // Базовые утилиты
+  // ---------------------------------------------------------------
+
+  function log() {
+    try {
+      const args = Array.prototype.slice.call(arguments);
+      args.unshift(logPrefix);
+      console.log.apply(console, args);
+    } catch (e) {
+      // молча проглатываем, если в консоль нельзя писать
+    }
+  }
 
   function safeJsonParse(text) {
     try {
       return JSON.parse(text);
-    } catch (e) {
-      log("JSON parse error:", e);
+    } catch {
       return null;
     }
   }
 
+  /**
+   * Извлекаем GUID визита субъекта из URL вида /subjectVisit/{id}
+   */
   function getCurrentSubjectVisitIdFromLocation() {
-    // Примеры:
-    //   /subjectVisit/f56d907e-bd8a-429b-bd70-7d7fc4dd86ea
-    //   /subjectVisit/cdeefbd9-afa0-4b8d-b307-4908d907ebe9/timePoints
-    const m = location.pathname.match(/\/subjectVisit\/([^/]+)/i);
+    const m = location.pathname.match(
+      /\/subjectVisit\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/
+    );
     return m ? m[1] : null;
   }
 
-  function whenAuthReady(cb) {
-    if (authHeaderValue) {
-      cb(authHeaderValue);
-    } else {
-      authReadyCallbacks.push(cb);
+  /**
+   * Получить (или создать) объект истории для конкретного субъекта
+   */
+  function getOrCreateSubjectHistory(subjectId) {
+    let h = measurementHistory.get(subjectId);
+    if (!h) {
+      h = {};
+      measurementHistory.set(subjectId, h);
     }
-  }
-
-  function notifyAuthReady() {
-    if (!authHeaderValue) return;
-    const callbacks = authReadyCallbacks.splice(0, authReadyCallbacks.length);
-    callbacks.forEach((cb) => {
-      try {
-        cb(authHeaderValue);
-      } catch (e) {
-        console.error(logPrefix, "authReady callback error", e);
-      }
-    });
+    return h;
   }
 
   function getHistory(subjectId) {
-    if (!subjectId) return null;
-    let map = vsHistoryBySubjectId.get(subjectId);
-    if (!map) {
-      map = Object.create(null);
-      vsHistoryBySubjectId.set(subjectId, map);
-    }
-    return map;
+    return measurementHistory.get(subjectId) || null;
   }
 
-  function addMeasurementToHistory(measurement) {
-    const {
-      subjectId,
-      fieldKey,
-      measuredAt,
-      subjectVisitId,
-      subjectVisitTitle,
-      visitDate,
-      sectionTitle,
-      timePointLabel,
-      value,
-      unit
-    } = measurement;
+  // ---------------------------------------------------------------
+  // Перехват XHR: токен + данные о визитах и формах
+  // ---------------------------------------------------------------
 
-    if (!subjectId || !fieldKey) return;
-
-    const history = getHistory(subjectId);
-    if (!history) return;
-
-    if (!history[fieldKey]) {
-      history[fieldKey] = [];
+  function installXhrHook() {
+    if (!window.XMLHttpRequest) {
+      log("XMLHttpRequest not found, cannot install hook");
+      return;
     }
 
-    const arr = history[fieldKey];
+    const origOpen = XMLHttpRequest.prototype.open;
+    const origSend = XMLHttpRequest.prototype.send;
+    const origSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
 
-    // Не дублируем если точно такое же уже есть
-    const exists = arr.some(
-      (m) =>
-        m.subjectVisitId === subjectVisitId &&
-        m.sectionTitle === sectionTitle &&
-        m.timePointLabel === timePointLabel &&
-        m.value === value
-    );
-    if (exists) return;
+    // Ловим Authorization
+    XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+      try {
+        if (
+          typeof name === "string" &&
+          name.toLowerCase() === "authorization" &&
+          typeof value === "string" &&
+          value.toLowerCase().startsWith("bearer")
+        ) {
+          authHeaderValue = value;
+          log("Captured Authorization header");
+        }
+      } catch (e) {
+        console.error(logPrefix, "Error in setRequestHeader hook:", e);
+      }
+      return origSetRequestHeader.apply(this, arguments);
+    };
 
-    arr.push({
-      subjectId,
-      fieldKey,
-      measuredAt: measuredAt || visitDate || null,
-      subjectVisitId,
-      subjectVisitTitle,
-      visitDate,
-      sectionTitle,
-      timePointLabel,
-      value,
-      unit
-    });
+    // Запоминаем URL
+    XMLHttpRequest.prototype.open = function (method, url) {
+      this.__vs_url = url;
+      return origOpen.apply(this, arguments);
+    };
 
-    // Сортировка по дате (новые сверху)
-    arr.sort((a, b) => {
-      const da = a.measuredAt || a.visitDate || "";
-      const db = b.measuredAt || b.visitDate || "";
-      if (da < db) return 1;
-      if (da > db) return -1;
-      return 0;
-    });
+    // Анализируем ответ
+    XMLHttpRequest.prototype.send = function (body) {
+      this.addEventListener("load", function () {
+        try {
+          const url = this.__vs_url || "";
+          if (!url) return;
+
+          // интересуют только текстовые ответы
+          if (this.responseType && this.responseType !== "" && this.responseType !== "text") {
+            return;
+          }
+
+          const text = this.responseText;
+          if (!text) return;
+
+          const json = safeJsonParse(text);
+          if (!json) return;
+
+          // /api/Subjects/{guid} -> список визитов субъекта
+          if (/\/api\/Subjects\/[0-9a-fA-F-]{36}/.test(url)) {
+            handleSubjectResponse(json, url);
+          }
+
+          // /api/SubjectsForm/{guid} -> данные по конкретной форме
+          if (/\/api\/SubjectsForm\/[0-9a-fA-F-]{36}/.test(url)) {
+            handleSubjectsFormResponse(json, url);
+          }
+        } catch (e) {
+          console.error(logPrefix, "Error in XHR load handler:", e);
+        }
+      });
+
+      return origSend.apply(this, arguments);
+    };
+
+    log("XHR hook installed");
   }
 
-  function formatDateTimeShort(isoString) {
-    if (!isoString) return "";
-    const d = new Date(isoString);
-    if (Number.isNaN(d.getTime())) return "";
-    const dd = String(d.getDate()).padStart(2, "0");
-    const mm = String(d.getMonth() + 1).padStart(2, "0");
-    const yyyy = d.getFullYear();
-    const hh = String(d.getHours()).padStart(2, "0");
-    const mi = String(d.getMinutes()).padStart(2, "0");
-    return `${dd}.${mm}.${yyyy} ${hh}:${mi}`;
-  }
-
-  // ------------------------------------------------------
-  // 3. Парсинг JSON API
-  // ------------------------------------------------------
-
-  function handleSubjectsResponse(subjectId, json) {
+  /**
+   * Обработка ответа /api/Subjects/{subjectId}
+   * Из него вытаскиваем:
+   *  - сам subjectId
+   *  - subjectVisitList -> список визитов, статус, дата
+   */
+  function handleSubjectResponse(json, url) {
     if (!json || !json.data) return;
     const data = json.data;
+    const subjectId = data.id;
+    if (!subjectId) return;
+
     const subjectVisitList = Array.isArray(data.subjectVisitList)
       ? data.subjectVisitList
       : [];
 
     const visits = subjectVisitList.map((sv) => {
-      const visit = sv.visit || {};
-      const vId = sv.id;
-      const date = sv.date || null;
-      const title = visit.title || "";
-      const index = typeof visit.index === "number" ? visit.index : null;
-      const status = sv.formCompletedStatus || null;
-
-      const subjId =
-        data.id ||
-        sv.subjectId ||
-        (sv.subject && sv.subject.id) ||
-        null;
-      if (subjId) {
-        subjectIdByVisitId.set(vId, subjId);
-      }
-
       return {
-        subjectVisitId: vId,
-        title,
-        date,
-        index,
-        formCompletedStatus: status
+        subjectVisitId: sv.id,
+        title: sv.visit && sv.visit.title ? sv.visit.title : "",
+        date: sv.date || null,
+        formCompletedStatus: sv.formCompletedStatus || ""
       };
     });
 
-    if (data.id) {
-      visitsBySubjectId.set(data.id, visits);
-      log("Stored visits for subject", data.id, visits);
-    } else {
-      log("Subjects response without subject id");
+    visitsBySubjectId.set(subjectId, visits);
+    subjectVisitList.forEach((sv) => {
+      if (sv.id) {
+        subjectIdByVisitId.set(sv.id, subjectId);
+      }
+    });
+
+    log("Stored visits for subject", subjectId, visits);
+
+    // Если мы уже на странице subjectVisit/{id} этого субъекта —
+    // можно сразу инициировать загрузку прошлых визитов
+    const currentVisitId = getCurrentSubjectVisitIdFromLocation();
+    if (currentVisitId && subjectIdByVisitId.get(currentVisitId) === subjectId) {
+      ensurePreviousVsLoadedForSubject(subjectId).then(() => {
+        triggerScanSoon();
+      });
     }
   }
 
-  function extractMeasurementsFromSubjectForm(json, context) {
+  /**
+   * Обработка ответа /api/SubjectsForm/{formId}
+   * Если это VS-форма, вытаскиваем измерения.
+   */
+  function handleSubjectsFormResponse(json, url) {
     if (!json || !json.data) return;
-    const sff = json.data;
+    const sf = json.data;
 
-    const subjectVisitId =
-      context.subjectVisitId ||
-      sff.subjectVisitId ||
-      (sff.subjectVisit && sff.subjectVisit.id) ||
-      getCurrentSubjectVisitIdFromLocation() ||
-      null;
-
-    const subjectId =
-      context.subjectId ||
-      (sff.subject && sff.subject.id) ||
-      (subjectVisitId && subjectIdByVisitId.get(subjectVisitId)) ||
-      null;
-
-    const form = sff.form || {};
-    const formTitle = form.title || "Жизненно-важные показатели";
+    const form = sf.form || sf.formDTO || {};
     const formType = form.formType || form.formTypeDTO || {};
     const formTypeKey = formType.formTypeKey || formType.key || null;
+    const title = form.title || "";
 
-    if (
-      formTypeKey !== "VS" &&
-      !/жизненно-важные показатели/i.test(formTitle)
-    ) {
+    const isVs =
+      formTypeKey === VS_FORM_TYPE_KEY ||
+      /жизненно-важные показатели/i.test(title);
+
+    if (!isVs) {
       return;
     }
 
-    const visitTitle = context.subjectVisitTitle || "";
-    const visitDate = context.visitDate || null;
-
-    let globalTimePointLabel = null;
-    if (Array.isArray(sff.subjectTimePointList) && sff.subjectTimePointList.length) {
-      const tp = sff.subjectTimePointList[0];
-      globalTimePointLabel =
-        tp.timePointName ||
-        tp.pointName ||
-        tp.title ||
-        tp.name ||
-        tp.label ||
-        null;
-    }
-
-    const fields = Array.isArray(sff.subjectFormFieldList)
-      ? sff.subjectFormFieldList
-      : [];
-
-    fields.forEach((sf) => {
-      const field = sf.field || sf.fieldDTO || {};
-      const fieldKey = field.fieldKey || field.key || null;
-      const fieldTitle = field.title || "";
-      const rawValue = sf.value;
-      const value =
-        rawValue === null || rawValue === undefined ? null : String(rawValue).trim();
-
-      if (!fieldKey || value === null || value === "") return;
-
-      const unit =
-        field.units ||
-        field.unit ||
-        (field.unitDTO && field.unitDTO.name) ||
-        null;
-
-      const measuredAt =
-        sf.measuredAt ||
-        sf.createdAt ||
-        sff.date ||
-        sff.createdAt ||
-        null;
-
-      let timePointLabel = globalTimePointLabel;
-      const tpId =
-        sf.subjectTimePointId ||
-        (sf.subjectTimePoint && sf.subjectTimePoint.id) ||
-        null;
-      if (tpId && Array.isArray(sff.subjectTimePointList)) {
-        const tpObj = sff.subjectTimePointList.find((tp) => tp.id === tpId);
-        if (tpObj) {
-          timePointLabel =
-            tpObj.timePointName ||
-            tpObj.pointName ||
-            tpObj.title ||
-            tpObj.name ||
-            tpObj.label ||
-            timePointLabel;
-        }
-      }
-
-      addMeasurementToHistory({
-        subjectId,
-        fieldKey,
-        measuredAt,
-        subjectVisitId,
-        subjectVisitTitle: visitTitle,
-        visitDate,
-        sectionTitle: formTitle,
-        timePointLabel,
-        value,
-        unit
-      });
-    });
-  }
-
-  // ------------------------------------------------------
-  // 4. Загрузка контекста субъекта и прошлых визитов
-  // ------------------------------------------------------
-
-  async function ensureSubjectContextLoaded() {
-    const currentVisitId = getCurrentSubjectVisitIdFromLocation();
-    if (!currentVisitId) return;
-
-    const knownSubjectId = subjectIdByVisitId.get(currentVisitId);
-    if (knownSubjectId && visitsBySubjectId.has(knownSubjectId)) {
-      return;
-    }
-
-    if (!authHeaderValue) {
-      log("No auth token yet, cannot load subject context");
-      return;
-    }
-
-    const baseUrl = location.origin;
-
-    // 1) /api/SubjectsVisit/{currentVisitId}
-    const visitResp = await fetch(
-      `${baseUrl}/api/SubjectsVisit/${encodeURIComponent(currentVisitId)}`,
-      {
-        method: "GET",
-        headers: {
-          Authorization: authHeaderValue,
-          Accept: "application/json, text/plain, */*"
-        },
-        credentials: "include"
-      }
-    );
-
-    const visitJson = safeJsonParse(await visitResp.text());
-    if (!visitJson || !visitJson.data) {
-      log("Failed to load current SubjectVisit");
-      return;
-    }
-
-    const sv = visitJson.data;
-    const subject =
-      sv.subject ||
-      sv.subjectDTO ||
+    const subjectVisitId =
+      sf.subjectVisitId ||
+      (sf.subjectVisit && sf.subjectVisit.id) ||
       null;
 
     const subjectId =
-      subject?.id ||
-      sv.subjectId ||
-      null;
+      subjectVisitId && subjectIdByVisitId.get(subjectVisitId);
+
+    const visitTitle =
+      (sf.subjectVisit &&
+        sf.subjectVisit.visit &&
+        sf.subjectVisit.visit.title) ||
+      (sf.subjectVisit && sf.subjectVisit.title) ||
+      "";
+
+    const visitDate =
+      (sf.subjectVisit && sf.subjectVisit.date) || null;
+
+    if (!subjectId) {
+      log(
+        "SubjectsForm (VS) but no subjectId mapping yet. visitId =",
+        subjectVisitId
+      );
+    }
+
+    extractMeasurementsFromSubjectForm(json, {
+      subjectId: subjectId || null,
+      subjectVisitId,
+      subjectVisitTitle: visitTitle,
+      visitDate
+    });
 
     if (subjectId) {
-      subjectIdByVisitId.set(currentVisitId, subjectId);
-    } else {
-      log("Cannot determine subjectId from SubjectsVisit");
+      triggerScanSoon();
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Загрузка прошлых визитов и VS-форм (самостоятельные fetch)
+  // ---------------------------------------------------------------
+
+  /**
+   * ВАЖНОЕ ИЗМЕНЕНИЕ:
+   * - Более мягкий фильтр прошлых визитов:
+   *   * исключаем текущий визит
+   *   * исключаем явно пустые ("Empty")
+   *   * если есть даты — берём только те, что раньше текущего по дате
+   * - Добавлено подробное логирование, чтобы видеть, что именно происходит.
+   */
+  async function ensurePreviousVsLoadedForSubject(subjectId) {
+    log("ensurePreviousVsLoadedForSubject: start for subject", subjectId);
+    if (!subjectId) {
+      log("ensurePreviousVsLoadedForSubject: no subjectId, exit");
+      return;
+    }
+    if (previousVsLoadedForSubject.has(subjectId)) {
+      log("ensurePreviousVsLoadedForSubject: already loaded for", subjectId);
+      return;
+    }
+    if (!authHeaderValue) {
+      log("ensurePreviousVsLoadedForSubject: no authHeaderValue yet");
       return;
     }
 
-    // 2) /api/Subjects/{subjectId}
-    const subjResp = await fetch(
-      `${baseUrl}/api/Subjects/${encodeURIComponent(subjectId)}`,
-      {
-        method: "GET",
-        headers: {
-          Authorization: authHeaderValue,
-          Accept: "application/json, text/plain, */*"
-        },
-        credentials: "include"
-      }
-    );
-
-    const subjJson = safeJsonParse(await subjResp.text());
-    handleSubjectsResponse(subjectId, subjJson);
-  }
-
-  async function ensurePreviousVsLoadedForSubject(subjectId) {
-    if (!subjectId) return;
-    if (previousVsLoadedForSubject.has(subjectId)) return;
-    if (!authHeaderValue) return;
-
     const visits = visitsBySubjectId.get(subjectId);
-    if (!Array.isArray(visits) || !visits.length) return;
+    log("ensurePreviousVsLoadedForSubject: visits for subject", subjectId, visits);
+
+    if (!Array.isArray(visits) || !visits.length) {
+      log("ensurePreviousVsLoadedForSubject: no visits, exit");
+      return;
+    }
 
     const currentVisitId = getCurrentSubjectVisitIdFromLocation();
+    const currentVisit =
+      visits.find((v) => v.subjectVisitId === currentVisitId) || null;
 
-    const currentVisit = visits.find((v) => v.subjectVisitId === currentVisitId) || null;
-
+    // Новый фильтр прошлых визитов
     const prevVisits = visits.filter((v) => {
       if (v.subjectVisitId === currentVisitId) return false;
-      const isCompleted = v.formCompletedStatus === "Completed";
+
+      const status = (v.formCompletedStatus || "").toLowerCase();
+      const notEmpty = status !== "empty";
+
       if (!currentVisit || !currentVisit.date || !v.date) {
-        return isCompleted;
+        // если нет информации по датам — берём все не Empty
+        return notEmpty;
       }
-      return isCompleted && v.date < currentVisit.date;
+
+      return notEmpty && v.date < currentVisit.date;
     });
 
+    log("ensurePreviousVsLoadedForSubject: previous visits to load", prevVisits);
+
     if (!prevVisits.length) {
+      log("ensurePreviousVsLoadedForSubject: no previous visits, mark done");
       previousVsLoadedForSubject.add(subjectId);
       return;
     }
@@ -435,8 +374,11 @@
 
     for (const v of prevVisits) {
       try {
+        log("Loading SubjectVisit", v.subjectVisitId);
         const resp = await fetch(
-          `${baseUrl}/api/SubjectsVisit/${encodeURIComponent(v.subjectVisitId)}`,
+          `${baseUrl}/api/SubjectsVisit/${encodeURIComponent(
+            v.subjectVisitId
+          )}`,
           {
             method: "GET",
             headers: {
@@ -446,31 +388,57 @@
             credentials: "include"
           }
         );
-        const json = safeJsonParse(await resp.text());
-        if (!json || !json.data) continue;
+
+        const text = await resp.text();
+        const json = safeJsonParse(text);
+        if (!json || !json.data) {
+          log("SubjectsVisit response without data for", v.subjectVisitId);
+          continue;
+        }
 
         const sv = json.data;
         const subjectFormList = Array.isArray(sv.subjectFormList)
           ? sv.subjectFormList
           : [];
 
+        log(
+          "SubjectVisit has",
+          subjectFormList.length,
+          "forms for visit",
+          v.subjectVisitId
+        );
+
+        // Ищем VS-формы по formTypeKey==='VS' или по названию
         const vsForms = subjectFormList.filter((sf) => {
           const form = sf.form || sf.formDTO || {};
           const formType = form.formType || form.formTypeDTO || {};
-          const formTypeKey = formType.formTypeKey || formType.key || null;
+          const formTypeKey =
+            formType.formTypeKey || formType.key || null;
           const title = form.title || "";
-          return (
-            formTypeKey === "VS" ||
-            /жизненно-важные показатели/i.test(title)
-          );
+          const isVs =
+            formTypeKey === VS_FORM_TYPE_KEY ||
+            /жизненно-важные показатели/i.test(title);
+
+          if (isVs) {
+            log(
+              "Found VS form in previous visit",
+              v.subjectVisitId,
+              "form title:",
+              title
+            );
+          }
+          return isVs;
         });
 
         for (const sf of vsForms) {
           const formId = sf.id || sf.subjectFormId;
           if (!formId) continue;
 
+          log("Loading SubjectsForm (VS) from previous visit", formId);
           const formResp = await fetch(
-            `${baseUrl}/api/SubjectsForm/${encodeURIComponent(formId)}`,
+            `${baseUrl}/api/SubjectsForm/${encodeURIComponent(
+              formId
+            )}`,
             {
               method: "GET",
               headers: {
@@ -480,7 +448,9 @@
               credentials: "include"
             }
           );
-          const formJson = safeJsonParse(await formResp.text());
+
+          const formText = await formResp.text();
+          const formJson = safeJsonParse(formText);
 
           extractMeasurementsFromSubjectForm(formJson, {
             subjectId,
@@ -495,256 +465,180 @@
     }
 
     previousVsLoadedForSubject.add(subjectId);
+    log("ensurePreviousVsLoadedForSubject: done for", subjectId);
   }
 
-  // ------------------------------------------------------
-  // 5. Перехват XHR (наблюдение за Authorization и формами)
-  // ------------------------------------------------------
+  // ---------------------------------------------------------------
+  // Разбор SubjectForm и накопление истории измерений
+  // ---------------------------------------------------------------
 
-  (function installXhrHook() {
-    const OriginalXHR = window.XMLHttpRequest;
-    if (!OriginalXHR) return;
+  /**
+   * Разбираем структуру SubjectForm и записываем значения в measurementHistory
+   * context:
+   *  - subjectId: GUID субъекта
+   *  - subjectVisitId: GUID визита субъекта
+   *  - subjectVisitTitle: заголовок визита
+   *  - visitDate: дата визита (ISO)
+   */
+  function extractMeasurementsFromSubjectForm(json, context) {
+    if (!json || !json.data) return;
 
-    function WrappedXHR() {
-      const xhr = new OriginalXHR();
+    const sf = json.data;
+    const subjectId = context.subjectId;
+    if (!subjectId) {
+      log(
+        "extractMeasurementsFromSubjectForm: no subjectId in context, skip",
+        context
+      );
+      return;
+    }
 
-      xhr.__vs_open = OriginalXHR.prototype.open;
-      xhr.__vs_send = OriginalXHR.prototype.send;
-      xhr.__vs_setRequestHeader = OriginalXHR.prototype.setRequestHeader;
-      xhr.__vs_url = "";
-      xhr.__vs_method = "";
-      xhr.__vs_requestHeaders = {};
+    const history = getOrCreateSubjectHistory(subjectId);
 
-      xhr.open = function (method, url, async, user, password) {
-        try {
-          xhr.__vs_method = method;
-          xhr.__vs_url = url;
-        } catch (e) {}
-        return xhr.__vs_open.call(this, method, url, async, user, password);
+    const form = sf.form || sf.formDTO || {};
+    const sectionTitle = form.title || "";
+
+    const timePoint =
+      sf.timePointTitle ||
+      sf.timePoint ||
+      (sf.timePointId ? String(sf.timePointId) : null);
+
+    const visitDate = context.visitDate || sf.date || sf.formDate || null;
+
+    // Пытаемся найти список полей с значениями
+    const fields = Array.isArray(sf.subjectFieldList)
+      ? sf.subjectFieldList
+      : Array.isArray(sf.fieldValueList)
+      ? sf.fieldValueList
+      : [];
+
+    log(
+      "extractMeasurementsFromSubjectForm: parsing",
+      fields.length,
+      "fields for subject",
+      subjectId,
+      "visit",
+      context.subjectVisitId
+    );
+
+    fields.forEach((f) => {
+      const field = f.field || f.fieldDTO || {};
+      const fieldKey =
+        field.fieldKey || field.key || f.fieldKey || null;
+      if (!fieldKey) return;
+
+      const rawValue =
+        f.value ??
+        f.fieldValue ??
+        f.numberValue ??
+        f.stringValue ??
+        null;
+
+      if (rawValue === null || rawValue === "") return;
+
+      const entry = {
+        fieldKey,
+        value: rawValue,
+        visitId: context.subjectVisitId || null,
+        visitTitle: context.subjectVisitTitle || "",
+        sectionTitle,
+        timePoint,
+        visitDate
       };
 
-      xhr.setRequestHeader = function (name, value) {
-        try {
-          xhr.__vs_requestHeaders[name.toLowerCase()] = value;
-          if (name.toLowerCase() === "authorization" && value.startsWith("Bearer ")) {
-            authHeaderValue = value;
-            notifyAuthReady();
-          }
-        } catch (e) {}
-        return xhr.__vs_setRequestHeader.call(this, name, value);
-      };
+      if (!history[fieldKey]) history[fieldKey] = [];
+      history[fieldKey].push(entry);
+    });
 
-      xhr.addEventListener("load", function () {
-        try {
-          const url = xhr.__vs_url || "";
-          const method = (xhr.__vs_method || "GET").toUpperCase();
-          if (!url || method !== "GET") return;
-          if (!xhr.responseText) return;
-
-          const absUrl = new URL(url, location.origin).toString();
-
-          const mSubjects = absUrl.match(/\/api\/Subjects\/([^/?#]+)/i);
-          if (mSubjects) {
-            const subjectId = mSubjects[1];
-            const json = safeJsonParse(xhr.responseText);
-            handleSubjectsResponse(subjectId, json);
-            return;
-          }
-
-          const mForm = absUrl.match(/\/api\/SubjectsForm\/([^/?#]+)/i);
-          if (mForm) {
-            const json = safeJsonParse(xhr.responseText);
-            extractMeasurementsFromSubjectForm(json, {});
-            return;
-          }
-        } catch (e) {
-          console.error(logPrefix, "XHR load handler error", e);
+    // сортируем каждое поле по дате визита (новое -> старое)
+    Object.keys(history).forEach((fk) => {
+      history[fk].sort((a, b) => {
+        if (a.visitDate && b.visitDate) {
+          if (a.visitDate < b.visitDate) return 1;
+          if (a.visitDate > b.visitDate) return -1;
         }
+        return 0;
       });
-
-      return xhr;
-    }
-
-    for (const key in OriginalXHR) {
-      if (Object.prototype.hasOwnProperty.call(OriginalXHR, key)) {
-        WrappedXHR[key] = OriginalXHR[key];
-      }
-    }
-
-    window.XMLHttpRequest = WrappedXHR;
-
-    log("XHR hook installed");
-  })();
-
-  // ------------------------------------------------------
-  // 6. UI: подписи и попапы под инпутами
-  // ------------------------------------------------------
-
-  function injectHistoryUIForField(inputEl, fieldKey, fieldTitle, subjectId, currentVisitId) {
-    if (!inputEl || !fieldKey || !subjectId) return;
-
-    const history = getHistory(subjectId);
-    if (!history) return;
-
-    const allEntries = history[fieldKey] || [];
-    if (!allEntries.length) return;
-
-    const previousOnly = allEntries.filter(
-      (e) => e.subjectVisitId && e.subjectVisitId !== currentVisitId
-    );
-    if (!previousOnly.length) return;
-
-    const latestPrev = previousOnly[0];
-
-    const wrapper =
-      inputEl.closest(
-        ".MuiFormControl-root, .MuiFormGroup-root, .MuiFormControlLabel-root, .MuiGrid-item"
-      ) || inputEl.parentElement;
-
-    if (!wrapper) return;
-
-    if (getComputedStyle(wrapper).position === "static") {
-      wrapper.style.position = "relative";
-    }
-
-    let historyContainer = wrapper.querySelector(".vs-history-container");
-    if (!historyContainer) {
-      historyContainer = document.createElement("div");
-      historyContainer.className = "vs-history-container";
-
-      if (inputEl.nextSibling) {
-        wrapper.insertBefore(historyContainer, inputEl.nextSibling);
-      } else {
-        wrapper.appendChild(historyContainer);
-      }
-    } else {
-      historyContainer.innerHTML = "";
-    }
-
-    const latestLine = document.createElement("div");
-    latestLine.className = "vs-history-latest";
-
-    const visitPart = latestPrev.subjectVisitTitle
-      ? `визит: ${latestPrev.subjectVisitTitle}`
-      : "";
-    const sectionPart = latestPrev.sectionTitle
-      ? `секция: ${latestPrev.sectionTitle}`
-      : "";
-    const timePointPart = latestPrev.timePointLabel
-      ? `точка: ${latestPrev.timePointLabel}`
-      : "";
-    const datePart = latestPrev.measuredAt
-      ? `(${formatDateTimeShort(latestPrev.measuredAt)})`
-      : latestPrev.visitDate
-        ? `(${formatDateTimeShort(latestPrev.visitDate)})`
-        : "";
-
-    const metaParts = [visitPart, sectionPart, timePointPart].filter(Boolean);
-    const metaText = metaParts.length ? `, ${metaParts.join(", ")}` : "";
-
-    latestLine.textContent =
-      `Предыдущее: ${latestPrev.value}` +
-      (latestPrev.unit ? ` ${latestPrev.unit}` : "") +
-      metaText +
-      (datePart ? ` ${datePart}` : "");
-
-    const toggleBtn = document.createElement("button");
-    toggleBtn.type = "button";
-    toggleBtn.className = "vs-history-toggle-btn";
-    toggleBtn.textContent = "История";
-
-    const popup = document.createElement("div");
-    popup.className = "vs-history-popup";
-    popup.style.display = "none";
-
-    const titleEl = document.createElement("div");
-    titleEl.className = "vs-history-popup-title";
-    titleEl.textContent = fieldTitle || fieldKey || "Поле";
-
-    popup.appendChild(titleEl);
-
-    previousOnly.forEach((entry) => {
-      const row = document.createElement("div");
-      row.className = "vs-history-popup-row";
-
-      const left = document.createElement("div");
-      left.className = "vs-history-popup-row-main";
-      left.textContent =
-        `${entry.value}` + (entry.unit ? ` ${entry.unit}` : "");
-
-      const right = document.createElement("div");
-      right.className = "vs-history-popup-row-meta";
-
-      const parts = [];
-      if (entry.subjectVisitTitle) parts.push(entry.subjectVisitTitle);
-      if (entry.sectionTitle) parts.push(entry.sectionTitle);
-      if (entry.timePointLabel) parts.push(entry.timePointLabel);
-      const meta = parts.join(" · ");
-
-      const dateStr =
-        entry.measuredAt || entry.visitDate
-          ? formatDateTimeShort(entry.measuredAt || entry.visitDate)
-          : "";
-
-      right.textContent = [meta, dateStr].filter(Boolean).join(" • ");
-
-      row.appendChild(left);
-      row.appendChild(right);
-      popup.appendChild(row);
     });
 
-    historyContainer.appendChild(latestLine);
-    historyContainer.appendChild(toggleBtn);
-    historyContainer.appendChild(popup);
-
-    let opened = false;
-
-    function setOpened(value) {
-      opened = value;
-      popup.style.display = opened ? "block" : "none";
-    }
-
-    toggleBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      setOpened(!opened);
-    });
-
-    document.addEventListener(
-      "click",
-      (e) => {
-        if (!opened) return;
-        if (
-          !popup.contains(e.target) &&
-          !toggleBtn.contains(e.target)
-        ) {
-          setOpened(false);
-        }
-      },
-      { capture: true }
+    log(
+      "extractMeasurementsFromSubjectForm: updated history keys for subject",
+      subjectId,
+      Object.keys(history)
     );
   }
 
+  // ---------------------------------------------------------------
+  // DOM: поиск инпутов и отрисовка подсказок
+  // ---------------------------------------------------------------
+
+  function triggerScanSoon() {
+    if (scanScheduled) return;
+    scanScheduled = true;
+    setTimeout(() => {
+      scanScheduled = false;
+      try {
+        scanAndInjectForAllFields();
+      } catch (e) {
+        console.error(logPrefix, "Error in scanAndInjectForAllFields:", e);
+      }
+    }, 300);
+  }
+
+  /**
+   * Обход всех известных fieldKey и попытка найти соответствующие им инпуты.
+   * Ищем по:
+   *  - data-annotation-key="{fieldKey}"
+   *  - input[data-annotation-key="{fieldKey}"]
+   *  - input[name="{fieldKey}"]
+   */
   function scanAndInjectForAllFields() {
     const subjectVisitId = getCurrentSubjectVisitIdFromLocation();
-    const subjectId = subjectVisitId && subjectIdByVisitId.get(subjectVisitId);
-    if (!subjectId) return;
+    const subjectId =
+      subjectVisitId && subjectIdByVisitId.get(subjectVisitId);
+
+    if (!subjectId) {
+      log(
+        "scanAndInjectForAllFields: no subjectId for current visit",
+        subjectVisitId
+      );
+      return;
+    }
 
     const history = getHistory(subjectId);
-    if (!history) return;
+    if (!history) {
+      log("scanAndInjectForAllFields: no history map for subject", subjectId);
+      return;
+    }
 
     const currentVisitId = subjectVisitId;
-    const knownFieldKeys = new Set(Object.keys(history));
-    if (!knownFieldKeys.size) return;
+    const fieldKeys = Object.keys(history);
+    if (!fieldKeys.length) {
+      log("scanAndInjectForAllFields: history is empty for subject", subjectId);
+      return;
+    }
+
+    log("scanAndInjectForAllFields: fieldKeys with history", fieldKeys);
 
     const selectorParts = [];
-    knownFieldKeys.forEach((fk) => {
+    fieldKeys.forEach((fk) => {
       selectorParts.push(
         `[data-annotation-key="${fk}"] input`,
         `input[data-annotation-key="${fk}"]`,
         `input[name="${fk}"]`
       );
     });
-    const inputs = document.querySelectorAll(selectorParts.join(","));
+
+    const selector = selectorParts.join(",");
+    const inputs = document.querySelectorAll(selector);
+
+    log(
+      "scanAndInjectForAllFields: found",
+      inputs.length,
+      "inputs for keys",
+      fieldKeys
+    );
+
     inputs.forEach((inputEl) => {
       if (!inputEl || inputEl.__vsHistoryInjected) return;
 
@@ -754,136 +648,280 @@
         null;
       if (!fieldKey || !history[fieldKey]) return;
 
+      // Имя поля для отображения (пытаемся взять label)
       let fieldTitle = fieldKey;
       const labelEl =
         inputEl.closest(".MuiFormControl-root")?.querySelector("label") ||
-        inputEl.closest(".MuiFormControl-root")?.querySelector(
-          ".MuiFormLabel-root"
-        );
+        inputEl
+          .closest(".MuiFormControl-root")
+          ?.querySelector(".MuiFormLabel-root");
       if (labelEl && labelEl.textContent) {
         fieldTitle = labelEl.textContent.trim();
       }
 
-      injectHistoryUIForField(inputEl, fieldKey, fieldTitle, subjectId, currentVisitId);
+      log(
+        "scanAndInjectForAllFields: injecting history UI for fieldKey",
+        fieldKey,
+        "title:",
+        fieldTitle
+      );
+
+      injectHistoryUIForField(
+        inputEl,
+        fieldKey,
+        fieldTitle,
+        subjectId,
+        currentVisitId
+      );
       inputEl.__vsHistoryInjected = true;
     });
   }
 
-  function setupMutationObserver() {
-    const observer = new MutationObserver(() => {
-      try {
-        scanAndInjectForAllFields();
-      } catch (e) {
-        console.error(logPrefix, "MutationObserver error", e);
-      }
+  /**
+   * Создаём UI под конкретным инпутом:
+   *  - "Предыдущее: ..."
+   *  - кнопка "История" с попапом
+   */
+  function injectHistoryUIForField(
+    inputEl,
+    fieldKey,
+    fieldTitle,
+    subjectId,
+    currentVisitId
+  ) {
+    const history = getHistory(subjectId);
+    if (!history || !history[fieldKey] || !history[fieldKey].length) {
+      log(
+        "injectHistoryUIForField: no history for fieldKey",
+        fieldKey,
+        "subject",
+        subjectId
+      );
+      return;
+    }
+
+    // Берём только прошлые визиты (не текущий)
+    const prevEntries = history[fieldKey].filter(
+      (e) => e.visitId && e.visitId !== currentVisitId
+    );
+    if (!prevEntries.length) {
+      log(
+        "injectHistoryUIForField: no previous entries for fieldKey",
+        fieldKey
+      );
+      return;
+    }
+
+    const last = prevEntries[0]; // уже отсортировано: [новые -> старые]
+
+    const formControl =
+      inputEl.closest(".MuiFormControl-root") || inputEl.parentElement;
+    if (!formControl) {
+      log(
+        "injectHistoryUIForField: cannot find formControl for fieldKey",
+        fieldKey
+      );
+      return;
+    }
+
+    let host = formControl.querySelector(".vs-helper-field-info");
+    if (!host) {
+      host = document.createElement("div");
+      host.className = "vs-helper-field-info";
+      formControl.appendChild(host);
+    }
+
+    // Перерисовываем содержимое, чтобы избежать дублей
+    host.innerHTML = "";
+
+    const lastLine = document.createElement("div");
+    lastLine.className = "vs-helper-last-value";
+    lastLine.textContent = buildLastLineText(fieldTitle, last);
+    host.appendChild(lastLine);
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "vs-helper-history-btn";
+    btn.textContent = "История";
+
+    const popup = buildHistoryPopup(fieldTitle, prevEntries);
+    popup.style.display = "none";
+
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      popup.style.display = popup.style.display === "none" ? "block" : "none";
     });
 
-    observer.observe(document.documentElement, {
-      childList: true,
-      subtree: true
-    });
-
-    setTimeout(scanAndInjectForAllFields, 2000);
+    host.appendChild(btn);
+    host.appendChild(popup);
   }
 
-  // ------------------------------------------------------
-  // 7. Отслеживание смены URL (SPA)
-  // ------------------------------------------------------
+  function buildLastLineText(fieldTitle, entry) {
+    const parts = [];
 
-  async function handleVisitChange() {
-    const newVisitId = getCurrentSubjectVisitIdFromLocation();
-    if (!newVisitId) {
-      currentVisitIdCache = null;
-      return;
-    }
-    if (newVisitId === currentVisitIdCache) {
-      return; // визит не изменился
+    parts.push(`${fieldTitle}: ${entry.value}`);
+
+    if (entry.visitTitle) {
+      parts.push(entry.visitTitle);
     }
 
-    log("Detected visit change:", currentVisitIdCache, "→", newVisitId);
-    currentVisitIdCache = newVisitId;
-
-    // Убираем старые контейнеры историй (иначе останутся "висячие" подписи)
-    document
-      .querySelectorAll(".vs-history-container")
-      .forEach((el) => el.remove());
-
-    // Сбрасывать __vsHistoryInjected на input'ах не нужно:
-    // новые DOM-ноды будут без этого флага, старые со временем уйдут.
-
-    if (!authHeaderValue) {
-      // как только появится токен, ensureSubjectContextLoaded все равно отработает
-      return;
+    if (entry.timePoint) {
+      parts.push(`ТП: ${entry.timePoint}`);
     }
 
-    try {
-      await ensureSubjectContextLoaded();
-      const subjectId = subjectIdByVisitId.get(newVisitId);
-      if (!subjectId) {
-        log("No subjectId for visit", newVisitId);
-        return;
+    if (entry.visitDate) {
+      const d = new Date(entry.visitDate);
+      if (!isNaN(d.getTime())) {
+        const ds = d.toLocaleDateString("ru-RU");
+        parts.push(ds);
+      }
+    }
+
+    return `Предыдущее: ${parts.join(" · ")}`;
+  }
+
+  function buildHistoryPopup(fieldTitle, entries) {
+    const popup = document.createElement("div");
+    popup.className = "vs-helper-history-popup";
+
+    const titleEl = document.createElement("div");
+    titleEl.className = "vs-helper-history-title";
+    titleEl.textContent = `История: ${fieldTitle}`;
+    popup.appendChild(titleEl);
+
+    const list = document.createElement("ul");
+    list.className = "vs-helper-history-list";
+
+    entries.forEach((e) => {
+      const li = document.createElement("li");
+      li.className = "vs-helper-history-item";
+
+      const parts = [];
+      parts.push(String(e.value));
+
+      if (e.visitTitle) parts.push(e.visitTitle);
+      if (e.timePoint) parts.push(`ТП: ${e.timePoint}`);
+
+      if (e.visitDate) {
+        const d = new Date(e.visitDate);
+        if (!isNaN(d.getTime())) {
+          const ds = d.toLocaleDateString("ru-RU");
+          parts.push(ds);
+        }
       }
 
-      await ensurePreviousVsLoadedForSubject(subjectId);
+      li.textContent = parts.join(" · ");
+      list.appendChild(li);
+    });
 
-      // После подгрузки истории — пробежаться по DOM и вставить подписи.
-      scanAndInjectForAllFields();
-    } catch (e) {
-      console.error(logPrefix, "handleVisitChange error:", e);
+    popup.appendChild(list);
+    return popup;
+  }
+
+  // ---------------------------------------------------------------
+  // DOM-наблюдатель + отслеживание SPA-навигации
+  // ---------------------------------------------------------------
+
+  function installDomObserver() {
+    const rootEl = document.getElementById("root") || document.body;
+    if (!rootEl || !window.MutationObserver) {
+      log("DOM observer not installed (no root or no MutationObserver)");
+      return;
     }
+
+    const observer = new MutationObserver((mutations) => {
+      let relevant = false;
+      for (const m of mutations) {
+        if (m.addedNodes && m.addedNodes.length) {
+          relevant = true;
+          break;
+        }
+      }
+      if (relevant) {
+        triggerScanSoon();
+      }
+    });
+
+    observer.observe(rootEl, { childList: true, subtree: true });
+    log("DOM observer installed");
   }
 
   function installUrlWatcher() {
-    currentVisitIdCache = getCurrentSubjectVisitIdFromLocation();
+    let lastHrefLocal = location.href;
+
+    function check() {
+      if (location.href !== lastHrefLocal) {
+        const oldHref = lastHrefLocal;
+        lastHrefLocal = location.href;
+        lastLocationHref = location.href;
+        log("URL changed:", oldHref, "->", lastHrefLocal);
+        onLocationChange();
+      }
+    }
 
     const origPushState = history.pushState;
     const origReplaceState = history.replaceState;
 
-    if (origPushState) {
-      history.pushState = function (...args) {
-        const res = origPushState.apply(this, args);
-        setTimeout(handleVisitChange, 0);
-        return res;
-      };
-    }
+    history.pushState = function () {
+      const ret = origPushState.apply(this, arguments);
+      check();
+      return ret;
+    };
 
-    if (origReplaceState) {
-      history.replaceState = function (...args) {
-        const res = origReplaceState.apply(this, args);
-        setTimeout(handleVisitChange, 0);
-        return res;
-      };
-    }
+    history.replaceState = function () {
+      const ret = origReplaceState.apply(this, arguments);
+      check();
+      return ret;
+    };
 
-    window.addEventListener("popstate", () => {
-      setTimeout(handleVisitChange, 0);
-    });
+    window.addEventListener("popstate", check);
+
+    // На всякий случай — периодический опрос (React-router иногда не трогает history)
+    setInterval(check, 1000);
 
     log("URL watcher installed");
   }
 
-  // ------------------------------------------------------
-  // 8. Инициализация
-  // ------------------------------------------------------
+  function onLocationChange() {
+    triggerScanSoon();
 
-  whenAuthReady(() => {
-    ensureSubjectContextLoaded()
-      .then(() => {
-        const currentVisitId = getCurrentSubjectVisitIdFromLocation();
-        const subjectId = currentVisitId && subjectIdByVisitId.get(currentVisitId);
-        if (subjectId) {
-          ensurePreviousVsLoadedForSubject(subjectId).then(() => {
-            scanAndInjectForAllFields();
-          });
-        }
-      })
-      .catch((e) => {
-        console.error(logPrefix, "Failed to ensure subject context", e);
-      });
-  });
+    const subjectVisitId = getCurrentSubjectVisitIdFromLocation();
+    if (!subjectVisitId) {
+      log("onLocationChange: no subjectVisitId in URL");
+      return;
+    }
 
-  setupMutationObserver();
-  installUrlWatcher();
+    const subjectId = subjectIdByVisitId.get(subjectVisitId);
+    if (!subjectId) {
+      log(
+        "onLocationChange: no subjectId mapping for visit",
+        subjectVisitId
+      );
+      return;
+    }
 
-  log("VS Helper initialized");
+    ensurePreviousVsLoadedForSubject(subjectId).then(() => {
+      // после загрузки истории пробуем ещё раз подцепиться к DOM
+      triggerScanSoon();
+    });
+  }
+
+  // ---------------------------------------------------------------
+  // Инициализация
+  // ---------------------------------------------------------------
+
+  function init() {
+    try {
+      installXhrHook();
+      installDomObserver();
+      installUrlWatcher();
+      triggerScanSoon();
+      log("VS Helper initialized");
+    } catch (e) {
+      console.error(logPrefix, "Initialization error:", e);
+    }
+  }
+
+  // Запуск
+  init();
 })();
