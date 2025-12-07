@@ -1,6 +1,6 @@
 // content-script.js
 // ============================================================================
-// VS Helper 
+// VS Helper — подсказки по последним ЖВП для форм "Жизненно-важные показатели"
 // ============================================================================
 
 (function () {
@@ -36,51 +36,43 @@
     return window.location.origin;
   }
 
-  // Получаем pathname без query/fragment
   function getPathname() {
     return window.location.pathname || "/";
   }
 
   // ----------------------------------------
-  // Парсинг ID из URL (субъект / визит)
+  // Парсинг ID из URL
   // ----------------------------------------
 
   function parseSubjectIdFromUrl(pathname) {
-    // Примеры:
-    // /subject/36364b78-79c6-47e6-a8f3-cfe9a88de29b/visits
     const m = pathname.match(/\/subject\/([0-9a-fA-F-]{36})/);
     return m ? m[1] : null;
   }
 
   function parseSubjectVisitIdFromUrl(pathname) {
-    // Примеры:
-    // /subjectVisit/f56d907e-bd8a-429b-bd70-7d7fc4dd86ea
     const m = pathname.match(/\/subjectVisit\/([0-9a-fA-F-]{36})/);
     return m ? m[1] : null;
   }
 
   // -----------------------------------
-  // Глобальное состояние расширения
+  // Глобальное состояние
   // -----------------------------------
 
-  // subjectId → { raw, visits: [{ subjectVisitId, date, formCompletedStatus }] }
+  // subjectId → { raw, visits: [{ subjectVisitId, date, formCompletedStatus, visitTitle }] }
   const subjectCache = new Map();
 
   // subjectVisitId → { raw, subjectFormList }
   const subjectVisitCache = new Map();
 
-  // subjectVisitId → subjectId (маппинг визита к субъекту)
+  // subjectVisitId → subjectId
   const subjectByVisit = new Map();
 
-  // subjectId → { fieldKey: { value, units, dateTime, visitTitle, visitDate, subjectVisitId } }
-  // Здесь храним ТОЛЬКО ПОСЛЕДНИЕ значения ЖВП из последнего предыдущего визита
+  // subjectId → { fieldKey: { value, units, dateTime, visitTitle, visitDate, subjectVisitId, fieldTitle } }
   const lastVsHistoryBySubject = new Map();
 
-  // Текущий контекст страницы
   const pageState = {
     currentSubjectId: null,
     currentSubjectVisitId: null,
-    routeScanScheduled: false,
     injectionScheduled: false,
   };
 
@@ -107,7 +99,6 @@
       visits,
     });
 
-    // Заполнить обратный маппинг subjectVisitId → subjectId
     for (const v of visits) {
       if (v.subjectVisitId) {
         subjectByVisit.set(v.subjectVisitId, subjectId);
@@ -127,17 +118,10 @@
         : [],
     });
 
-    // Попробуем вытащить subjectId
+    // Связываем визит с субъектом, НО НЕ трогаем subjectCache
     const subject = data.subject || {};
     if (subject.id) {
       subjectByVisit.set(subjectVisitId, subject.id);
-      // Если у нас ещё нет этого субъекта в subjectCache, хотя бы минимально заполним
-      if (!subjectCache.has(subject.id)) {
-        subjectCache.set(subject.id, {
-          raw: null,
-          visits: [], // при желании потом дополним через /api/Subjects/{id}
-        });
-      }
     }
 
     log(
@@ -150,11 +134,21 @@
 
   async function ensureSubjectLoaded(subjectId, baseUrl) {
     if (!subjectId) return null;
-    if (subjectCache.has(subjectId)) {
-      return subjectCache.get(subjectId);
+
+    const cached = subjectCache.get(subjectId);
+    // Если уже есть "нормальный" объект с визитами — используем
+    if (
+      cached &&
+      cached.raw &&
+      Array.isArray(cached.visits) &&
+      cached.visits.length > 0
+    ) {
+      return cached;
     }
 
+    // Иначе — всё равно грузим /api/Subjects/{id}
     try {
+      log("ensureSubjectLoaded: fetching /api/Subjects/", subjectId);
       const resp = await fetch(`${baseUrl}/api/Subjects/${subjectId}`, {
         credentials: "include",
       });
@@ -178,6 +172,10 @@
     }
 
     try {
+      log(
+        "ensureSubjectVisitLoaded: fetching /api/SubjectsVisit/",
+        subjectVisitId
+      );
       const resp = await fetch(
         `${baseUrl}/api/SubjectsVisit/${subjectVisitId}`,
         {
@@ -186,7 +184,10 @@
       );
       const json = await resp.json();
       if (!json || !json.data) {
-        warn("ensureSubjectVisitLoaded: empty data for visit", subjectVisitId);
+        warn(
+          "ensureSubjectVisitLoaded: empty data for visit",
+          subjectVisitId
+        );
         return null;
       }
       onSubjectVisitResponse(subjectVisitId, json.data);
@@ -202,7 +203,6 @@
   // -----------------------------------------
 
   function extractVsValuesFromSubjectForm(formJson) {
-    // Пытаемся быть максимально толерантными к структурам
     const result = [];
     if (!formJson || !formJson.data) return result;
     const f = formJson.data;
@@ -215,7 +215,6 @@
     const formTypeKey =
       formMeta.formTypeKey || formMeta.key || formMeta.code || null;
 
-    // Всё равно страхуемся по названию
     const isVsForm =
       (formTypeKey && formTypeKey.toUpperCase() === "VS") ||
       /Жизненно-важные показатели/i.test(formTitle);
@@ -285,7 +284,6 @@
 
     const baseUrl = getBaseUrl();
 
-    // Если уже считали историю раньше — повторно не грузим
     if (
       lastVsHistoryBySubject.has(subjectId) &&
       Object.keys(lastVsHistoryBySubject.get(subjectId) || {}).length > 0
@@ -293,7 +291,6 @@
       return;
     }
 
-    // 1. Убедимся, что у нас есть список визитов субъекта
     const subjectInfo = await ensureSubjectLoaded(subjectId, baseUrl);
     if (!subjectInfo) {
       warn("ensureLastVsHistoryLoaded: no subject info for", subjectId);
@@ -303,22 +300,20 @@
     const visits = subjectInfo.visits || [];
     if (!visits.length) {
       warn("ensureLastVsHistoryLoaded: subject has no visits", subjectId);
+      lastVsHistoryBySubject.set(subjectId, {});
       return;
     }
 
-    // 2. Найдём текущий визит и его дату
     const currentVisitMeta = visits.find(
       (v) => v.subjectVisitId === currentSubjectVisitId
     );
     const currentDate = currentVisitMeta ? currentVisitMeta.date : null;
 
-    // 3. Отсортируем визиты по дате DESC и найдём последний ПРЕДЫДУЩИЙ визит с ЖВП
     const sorted = [...visits].filter((v) => v.subjectVisitId);
-
     sorted.sort((a, b) => {
       const ad = a.date ? a.date.getTime() : 0;
       const bd = b.date ? b.date.getTime() : 0;
-      return bd - ad; // по убыванию
+      return bd - ad;
     });
 
     let lastVsVisitId = null;
@@ -327,21 +322,13 @@
 
     for (const v of sorted) {
       if (!v.subjectVisitId) continue;
-      if (v.subjectVisitId === currentSubjectVisitId) {
-        // Пропускаем текущий визит — нам нужны только предыдущие
-        continue;
-      }
-      if (v.formCompletedStatus && v.formCompletedStatus === "Empty") {
-        // Пустые формы нам не интересны
-        continue;
-      }
+      if (v.subjectVisitId === currentSubjectVisitId) continue;
+      if (v.formCompletedStatus && v.formCompletedStatus === "Empty") continue;
 
-      // Если есть дата текущего визита — берём только более ранние
       if (currentDate && v.date && v.date.getTime() >= currentDate.getTime()) {
         continue;
       }
 
-      // Загрузим детали визита (если ещё нет)
       const svDetails = await ensureSubjectVisitLoaded(
         v.subjectVisitId,
         baseUrl
@@ -351,7 +338,6 @@
       const forms = svDetails.subjectFormList || [];
       if (!forms.length) continue;
 
-      // Ищем формы ЖВП
       const vsForms = forms.filter((f) => {
         const formType = f.formType || {};
         const title = formType.title || f.title || "";
@@ -385,11 +371,10 @@
         "current visit",
         currentSubjectVisitId
       );
-      lastVsHistoryBySubject.set(subjectId, {}); // помечаем как "пусто"
+      lastVsHistoryBySubject.set(subjectId, {});
       return;
     }
 
-    // 4. Загрузим формы ЖВП для найденного визита
     const lastVisitDetails =
       subjectVisitCache.get(lastVsVisitId) ||
       (await ensureSubjectVisitLoaded(lastVsVisitId, baseUrl));
@@ -442,7 +427,6 @@
           const key = v.fieldKey;
           if (!key) continue;
 
-          // Если по этому полю уже что-то есть — сравниваем по capturedAt
           const existing = history[key];
           const newDt = v.capturedAt || lastVsVisitDate;
           if (!existing) {
@@ -457,10 +441,7 @@
             };
           } else {
             const oldDt = existing.dateTime || existing.visitDate || null;
-            if (
-              newDt &&
-              (!oldDt || newDt.getTime() > oldDt.getTime())
-            ) {
+            if (newDt && (!oldDt || newDt.getTime() > oldDt.getTime())) {
               history[key] = {
                 value: v.value,
                 units: v.units,
@@ -492,24 +473,17 @@
   // ---------------------------------------------
 
   function findAllNumericInputsInVsForm() {
-    // Здесь мы ничего не знаем о внутреннем React-коде,
-    // поэтому сканируем DOM по label'ам/placeholder'ам и input[type=number/text]
     const root = document.querySelector("#root");
     if (!root) return [];
-
-    // Простейший вариант: берём все input[type=number], input[role=spinbutton] и т.п.
     const inputs = Array.from(
-      root.querySelectorAll("input[type='number'], input[inputmode='decimal'], input[role='spinbutton']")
+      root.querySelectorAll(
+        "input[type='number'], input[inputmode='decimal'], input[role='spinbutton']"
+      )
     );
-
     return inputs;
   }
 
   function findFieldKeyForInput(input) {
-    // Здесь важно привязать input к fieldKey (SAD, DAD, HR, HR1, TEMP, BR).
-    // Мы можем использовать data-атрибуты, если они есть, или текст label рядом.
-    // Пока сделаем максимально простой эвристический вариант.
-
     const container = input.closest("div");
     if (!container) return null;
 
@@ -520,7 +494,6 @@
 
     const labelText = label ? (label.textContent || "").trim() : "";
 
-    // Очень грубое сопоставление по русским названиям
     if (/САД/i.test(labelText)) return "SAD";
     if (/ДАД/i.test(labelText)) return "DAD";
     if (/ЧСС/i.test(labelText)) return "HR";
@@ -528,7 +501,6 @@
     if (/Температура тела/i.test(labelText)) return "TEMP";
     if (/ЧДД/i.test(labelText)) return "BR";
 
-    // Если есть data-field-key на input или контейнере — используем
     const dk =
       input.getAttribute("data-field-key") ||
       (container.getAttribute && container.getAttribute("data-field-key"));
@@ -548,7 +520,6 @@
 
     const span = document.createElement("span");
     span.textContent = text;
-
     wrapper.appendChild(span);
 
     if (typeof moreClickHandler === "function") {
@@ -601,7 +572,6 @@
       const h = history[fieldKey];
       if (!h) continue;
 
-      // Не дублируем подсказку, если уже есть
       const parent = input.parentElement;
       if (!parent) continue;
       const existingHint = parent.querySelector(
@@ -622,8 +592,6 @@
       if (dateStr) hintTextParts.push(`от ${dateStr}`);
 
       const hintEl = createHintElement(hintTextParts.join(" "), () => {
-        // Пока у нас загружается только последний визит с ЖВП,
-        // "Подробнее" можно использовать, например, для вывода alert с теми же данными
         alert(
           `Последние данные ЖВП по полю ${fieldKey}:\n` +
             `Значение: ${h.value} ${h.units || ""}\n` +
@@ -644,7 +612,7 @@
   }
 
   // ----------------------------------------------------
-  // XHR перехват — забираем ответы API, но не дёргаем их сами
+  // XHR перехват
   // ----------------------------------------------------
 
   (function patchXHR() {
@@ -693,7 +661,6 @@
     const json = safeJsonParse(text);
     if (!json || !json.data) return;
 
-    // /api/Subjects/{subjectId}
     const subjMatch = pathname.match(/\/api\/Subjects\/([0-9a-fA-F-]{36})$/);
     if (subjMatch) {
       const subjectId = subjMatch[1];
@@ -701,14 +668,13 @@
       return;
     }
 
-    // /api/SubjectsVisit/{subjectVisitId}
     const svMatch = pathname.match(
       /\/api\/SubjectsVisit\/([0-9a-fA-F-]{36})$/
     );
     if (svMatch) {
       const subjectVisitId = svMatch[1];
       onSubjectVisitResponse(subjectVisitId, json.data);
-      // Возможно, это текущий визит — обновим состояние
+
       if (!pageState.currentSubjectVisitId) {
         pageState.currentSubjectVisitId = subjectVisitId;
       }
@@ -720,13 +686,11 @@
       return;
     }
 
-    // /api/SubjectsForm/{subjectFormId} — здесь мы ничего не кэшируем,
-    // только могли бы использовать, если MIS сам ходит за формами.
-    // Пока полагаемся на свои fetch'и в ensureLastVsHistoryLoaded.
+    // /api/SubjectsForm/{id} пока не используем из перехвата
   }
 
   // -----------------------------------------------------
-  // Отслеживание смены "страниц" в SPA (history API)
+  // SPA route change
   // -----------------------------------------------------
 
   function onRouteChange() {
@@ -740,7 +704,6 @@
 
     if (subjectVisitId) {
       pageState.currentSubjectVisitId = subjectVisitId;
-      // Если по этому визиту мы уже знаем subjectId — обновим
       const linkedSubject = subjectByVisit.get(subjectVisitId);
       if (linkedSubject) {
         pageState.currentSubjectId = linkedSubject;
@@ -763,21 +726,17 @@
     if (pageState.injectionScheduled) return;
     pageState.injectionScheduled = true;
 
-    // Немного ждём, чтобы React успел дорисовать DOM
     setTimeout(async () => {
       pageState.injectionScheduled = false;
 
       const { currentSubjectVisitId } = pageState;
 
-      // Если мы на странице визита
       if (currentSubjectVisitId) {
-        // Если subjectId ещё не знаем — попробуем вывести его через subjectByVisit
         if (!pageState.currentSubjectId) {
           const subjId = subjectByVisit.get(currentSubjectVisitId);
           if (subjId) {
             pageState.currentSubjectId = subjId;
           } else {
-            // В крайнем случае можно подтянуть данные визита и взять subjectId оттуда
             const sv = await ensureSubjectVisitLoaded(
               currentSubjectVisitId,
               getBaseUrl()
@@ -799,13 +758,11 @@
           return;
         }
 
-        // Построим историю только по последнему предыдущему визиту с ЖВП
         await ensureLastVsHistoryLoaded(
           currentSubjectId,
           currentSubjectVisitId
         );
 
-        // Вколем подсказки в DOM
         injectHintsForCurrentForm();
       }
     }, 500);
@@ -835,7 +792,7 @@
   })();
 
   // -------------------------------------------------
-  // MutationObserver — на случай, если React дорисовывает форму позже
+  // MutationObserver
   // -------------------------------------------------
 
   (function setupMutationObserver() {
@@ -843,8 +800,6 @@
     if (!root) return;
 
     const observer = new MutationObserver(() => {
-      // При любых значимых изменениях DOM попробуем ещё раз
-      // но не чаще, чем позволяет scheduleInjection
       scheduleInjection();
     });
 
@@ -855,7 +810,6 @@
 
     log("MutationObserver attached");
 
-    // Первый запуск при загрузке
     onRouteChange();
   })();
 })();
