@@ -5,6 +5,7 @@
 // - Перехватывает XHR, чтобы:
 //   * вытащить токен Authorization (Bearer ...)
 //   * вытащить список визитов субъекта (Subjects/{id})
+//   * вытащить маппинг subjectVisitId -> subjectId (SubjectsVisit/{id})
 // - По этим данным:
 //   * находит предыдущие визиты текущего субъекта
 //   * загружает по ним формы "Жизненно-важные показатели"
@@ -188,7 +189,12 @@
 
           // /api/Subjects/{guid} -> список визитов субъекта
           if (/\/api\/Subjects\/[0-9a-fA-F-]{36}/.test(url)) {
-            handleSubjectResponse(json, url);
+            handleSubjectResponse(json);
+          }
+
+          // /api/SubjectsVisit/{guid} -> данные по конкретному визиту субъекта
+          if (/\/api\/SubjectsVisit\/[0-9a-fA-F-]{36}/.test(url)) {
+            handleSubjectsVisitResponse(json, url);
           }
 
           // /api/SubjectsForm/{guid} -> данные по конкретной форме
@@ -212,7 +218,7 @@
    *  - сам subjectId
    *  - subjectVisitList -> список визитов, статус, дата
    */
-  function handleSubjectResponse(json, url) {
+  function handleSubjectResponse(json) {
     if (!json || !json.data) return;
     const data = json.data;
     const subjectId = data.id;
@@ -244,6 +250,76 @@
     // можно сразу инициировать загрузку прошлых визитов
     const currentVisitId = getCurrentSubjectVisitIdFromLocation();
     if (currentVisitId && subjectIdByVisitId.get(currentVisitId) === subjectId) {
+      ensurePreviousVsLoadedForSubject(subjectId).then(() => {
+        triggerScanSoon();
+      });
+    }
+  }
+
+  /**
+   * Обработка /api/SubjectsVisit/{subjectVisitId} (XHR)
+   * Тут мы:
+   *  - вытаскиваем subjectId
+   *  - мапим subjectVisitId -> subjectId
+   *  - добавляем визит в visitsBySubjectId (чтобы что-то было даже до /api/Subjects/{id})
+   */
+  function handleSubjectsVisitResponse(json, url) {
+    if (!json || !json.data) return;
+
+    const sv = json.data;
+    const subjectVisitId =
+      sv.id ||
+      (url.match(/\/api\/SubjectsVisit\/([0-9a-fA-F-]{36})/) || [])[1] ||
+      null;
+
+    const subject =
+      sv.subject ||
+      sv.subjectDTO ||
+      null;
+
+    const subjectId =
+      (subject && subject.id) ||
+      sv.subjectId ||
+      null;
+
+    if (!subjectVisitId || !subjectId) {
+      log(
+        "handleSubjectsVisitResponse: cannot resolve subjectVisitId/subjectId",
+        "subjectVisitId=",
+        subjectVisitId,
+        "subjectId=",
+        subjectId
+      );
+      return;
+    }
+
+    subjectIdByVisitId.set(subjectVisitId, subjectId);
+
+    // minimally заполним visitsBySubjectId, чтобы не было пусто
+    const arr = visitsBySubjectId.get(subjectId) || [];
+    const exists = arr.some((v) => v.subjectVisitId === subjectVisitId);
+    if (!exists) {
+      arr.push({
+        subjectVisitId,
+        title: sv.visit && sv.visit.title ? sv.visit.title : "",
+        date: sv.date || null,
+        formCompletedStatus: sv.formCompletedStatus || ""
+      });
+      visitsBySubjectId.set(subjectId, arr);
+    }
+
+    log(
+      "handleSubjectsVisitResponse: mapped visit",
+      subjectVisitId,
+      "-> subject",
+      subjectId,
+      "visits now:",
+      arr
+    );
+
+    // На всякий случай — если это текущий визит, можно дернуть обеспечение предыдущих
+    const currentVisitId = getCurrentSubjectVisitIdFromLocation();
+    if (currentVisitId === subjectVisitId) {
       ensurePreviousVsLoadedForSubject(subjectId).then(() => {
         triggerScanSoon();
       });
@@ -309,16 +385,66 @@
   }
 
   // ---------------------------------------------------------------
-  // Загрузка прошлых визитов и VS-форм (самостоятельные fetch)
+  // Загрузка визитов и прошлых VS-форм (самостоятельные fetch)
   // ---------------------------------------------------------------
 
   /**
+   * Убедиться, что в visitsBySubjectId для subjectId есть полный список визитов.
+   * Если ничего (или только один визит) — тянем /api/Subjects/{subjectId}.
+   */
+  async function ensureVisitsLoadedForSubject(subjectId) {
+    const existing = visitsBySubjectId.get(subjectId);
+    if (Array.isArray(existing) && existing.length > 1) {
+      // уже что-то внятное есть, не трогаем
+      return;
+    }
+
+    if (!authHeaderValue) {
+      log("ensureVisitsLoadedForSubject: no authHeaderValue, cannot fetch");
+      return;
+    }
+
+    const baseUrl = location.origin;
+
+    try {
+      log("ensureVisitsLoadedForSubject: fetching /api/Subjects/", subjectId);
+      const resp = await fetch(
+        `${baseUrl}/api/Subjects/${encodeURIComponent(subjectId)}`,
+        {
+          method: "GET",
+          headers: {
+            Authorization: authHeaderValue,
+            Accept: "application/json, text/plain, */*"
+          },
+          credentials: "include"
+        }
+      );
+
+      const text = await resp.text();
+      const json = safeJsonParse(text);
+      if (!json) {
+        log("ensureVisitsLoadedForSubject: invalid JSON for subject", subjectId);
+        return;
+      }
+
+      handleSubjectResponse(json);
+    } catch (e) {
+      console.error(
+        logPrefix,
+        "ensureVisitsLoadedForSubject: error fetching subject",
+        subjectId,
+        e
+      );
+    }
+  }
+
+  /**
    * ВАЖНОЕ ИЗМЕНЕНИЕ:
-   * - Более мягкий фильтр прошлых визитов:
+   * - Перед поиском предыдущих визитов обязательно вызываем ensureVisitsLoadedForSubject.
+   * - Мягкий фильтр прошлых визитов:
    *   * исключаем текущий визит
    *   * исключаем явно пустые ("Empty")
    *   * если есть даты — берём только те, что раньше текущего по дате
-   * - Добавлено подробное логирование, чтобы видеть, что именно происходит.
    */
   async function ensurePreviousVsLoadedForSubject(subjectId) {
     log("ensurePreviousVsLoadedForSubject: start for subject", subjectId);
@@ -334,6 +460,9 @@
       log("ensurePreviousVsLoadedForSubject: no authHeaderValue yet");
       return;
     }
+
+    // сначала гарантируем, что список визитов подтянут
+    await ensureVisitsLoadedForSubject(subjectId);
 
     const visits = visitsBySubjectId.get(subjectId);
     log("ensurePreviousVsLoadedForSubject: visits for subject", subjectId, visits);
@@ -876,7 +1005,7 @@
 
     window.addEventListener("popstate", check);
 
-    // На всякий случай — периодический опрос (React-router иногда не трогает history)
+    // На всякий случай — периодический опрос
     setInterval(check, 1000);
 
     log("URL watcher installed");
@@ -894,14 +1023,14 @@
     const subjectId = subjectIdByVisitId.get(subjectVisitId);
     if (!subjectId) {
       log(
-        "onLocationChange: no subjectId mapping for visit",
+        "onLocationChange: no subjectId mapping for visit (yet)",
         subjectVisitId
       );
+      // Маппинг появится после /api/SubjectsVisit/{id}, который мы тоже перехватываем.
       return;
     }
 
     ensurePreviousVsLoadedForSubject(subjectId).then(() => {
-      // после загрузки истории пробуем ещё раз подцепиться к DOM
       triggerScanSoon();
     });
   }
