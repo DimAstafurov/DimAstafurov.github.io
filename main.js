@@ -11,6 +11,8 @@
 // 3) Строит историю значений по каждому fieldKey.
 // 4) Под каждым подходящим <input> показывает
 //    последнюю запись и кнопку "История" с попапом.
+// 5) Отслеживает смену URL в SPA (pushState/replaceState/popstate)
+//    и переинициализируется при переходе на другой визит.
 // ======================================================
 
 (() => {
@@ -50,12 +52,14 @@
   /**
    * История по субъекту:
    * subjectId -> { [fieldKey]: MeasurementEntry[] }
-   * MeasurementEntry: см. addMeasurementToHistory()
    */
   const vsHistoryBySubjectId = new Map();
 
   /** Для каких subjectId уже пытались загрузить прошлые визиты */
   const previousVsLoadedForSubject = new Set();
+
+  /** Последний известный subjectVisitId (для трекинга смены URL) */
+  let currentVisitIdCache = null;
 
   // ------------------------------------------------------
   // 2. Утилиты
@@ -182,9 +186,6 @@
   // 3. Парсинг JSON API
   // ------------------------------------------------------
 
-  /**
-   * Разбор /api/Subjects/{subjectId}
-   */
   function handleSubjectsResponse(subjectId, json) {
     if (!json || !json.data) return;
     const data = json.data;
@@ -200,7 +201,6 @@
       const index = typeof visit.index === "number" ? visit.index : null;
       const status = sv.formCompletedStatus || null;
 
-      // Запомним связь визит -> субъект
       const subjId =
         data.id ||
         sv.subjectId ||
@@ -227,15 +227,10 @@
     }
   }
 
-  /**
-   * Разбор JSON формы ЖВП (SubjectsForm).
-   * json ожидается формата: { message, data: { ... } }
-   */
   function extractMeasurementsFromSubjectForm(json, context) {
     if (!json || !json.data) return;
     const sff = json.data;
 
-    // Попробуем вытащить subjectVisitId и subjectId
     const subjectVisitId =
       context.subjectVisitId ||
       sff.subjectVisitId ||
@@ -254,7 +249,6 @@
     const formType = form.formType || form.formTypeDTO || {};
     const formTypeKey = formType.formTypeKey || formType.key || null;
 
-    // Если это не VS-форма — выходим.
     if (
       formTypeKey !== "VS" &&
       !/жизненно-важные показатели/i.test(formTitle)
@@ -265,8 +259,6 @@
     const visitTitle = context.subjectVisitTitle || "";
     const visitDate = context.visitDate || null;
 
-    // Попробуем вытащить «временную точку» из subjectTimePointList,
-    // если она вообще есть.
     let globalTimePointLabel = null;
     if (Array.isArray(sff.subjectTimePointList) && sff.subjectTimePointList.length) {
       const tp = sff.subjectTimePointList[0];
@@ -299,7 +291,6 @@
         (field.unitDTO && field.unitDTO.name) ||
         null;
 
-      // Возможное поле с временем/датой измерения
       const measuredAt =
         sf.measuredAt ||
         sf.createdAt ||
@@ -307,7 +298,6 @@
         sff.createdAt ||
         null;
 
-      // Если у поля есть спецификация временной точки — используем её.
       let timePointLabel = globalTimePointLabel;
       const tpId =
         sf.subjectTimePointId ||
@@ -345,16 +335,10 @@
   // 4. Загрузка контекста субъекта и прошлых визитов
   // ------------------------------------------------------
 
-  /**
-   * Загружаем:
-   *   /api/SubjectsVisit/{currentVisitId} -> subjectId
-   *   /api/Subjects/{subjectId} -> список визитов
-   */
   async function ensureSubjectContextLoaded() {
     const currentVisitId = getCurrentSubjectVisitIdFromLocation();
     if (!currentVisitId) return;
 
-    // Если subjectId по этому визиту уже известен и визиты уже загружены — выходим.
     const knownSubjectId = subjectIdByVisitId.get(currentVisitId);
     if (knownSubjectId && visitsBySubjectId.has(knownSubjectId)) {
       return;
@@ -421,10 +405,6 @@
     handleSubjectsResponse(subjectId, subjJson);
   }
 
-  /**
-   * Загружает все формы ЖВП по предыдущим завершенным визитам
-   * конкретного субъекта.
-   */
   async function ensurePreviousVsLoadedForSubject(subjectId) {
     if (!subjectId) return;
     if (previousVsLoadedForSubject.has(subjectId)) return;
@@ -435,12 +415,8 @@
 
     const currentVisitId = getCurrentSubjectVisitIdFromLocation();
 
-    // Найдем текущий визит чтобы знать дату/индекс
     const currentVisit = visits.find((v) => v.subjectVisitId === currentVisitId) || null;
 
-    // Фильтруем "завершенные" визиты:
-    //   - formCompletedStatus === "Completed"
-    //   - и/или дата < дата текущего визита (если есть)
     const prevVisits = visits.filter((v) => {
       if (v.subjectVisitId === currentVisitId) return false;
       const isCompleted = v.formCompletedStatus === "Completed";
@@ -459,7 +435,6 @@
 
     for (const v of prevVisits) {
       try {
-        // /api/SubjectsVisit/{visitId} -> subjectFormList
         const resp = await fetch(
           `${baseUrl}/api/SubjectsVisit/${encodeURIComponent(v.subjectVisitId)}`,
           {
@@ -479,7 +454,6 @@
           ? sv.subjectFormList
           : [];
 
-        // Ищем формы ЖВП
         const vsForms = subjectFormList.filter((sf) => {
           const form = sf.form || sf.formDTO || {};
           const formType = form.formType || form.formTypeDTO || {};
@@ -524,7 +498,7 @@
   }
 
   // ------------------------------------------------------
-  // 5. Перехват XHR (только наблюдение, не ломаем логику сайта)
+  // 5. Перехват XHR (наблюдение за Authorization и формами)
   // ------------------------------------------------------
 
   (function installXhrHook() {
@@ -534,7 +508,6 @@
     function WrappedXHR() {
       const xhr = new OriginalXHR();
 
-      // Сохраняем метод и url, чтобы в onload понимать что за запрос
       xhr.__vs_open = OriginalXHR.prototype.open;
       xhr.__vs_send = OriginalXHR.prototype.send;
       xhr.__vs_setRequestHeader = OriginalXHR.prototype.setRequestHeader;
@@ -546,9 +519,7 @@
         try {
           xhr.__vs_method = method;
           xhr.__vs_url = url;
-        } catch (e) {
-          // ignore
-        }
+        } catch (e) {}
         return xhr.__vs_open.call(this, method, url, async, user, password);
       };
 
@@ -559,9 +530,7 @@
             authHeaderValue = value;
             notifyAuthReady();
           }
-        } catch (e) {
-          // ignore
-        }
+        } catch (e) {}
         return xhr.__vs_setRequestHeader.call(this, name, value);
       };
 
@@ -569,14 +538,11 @@
         try {
           const url = xhr.__vs_url || "";
           const method = (xhr.__vs_method || "GET").toUpperCase();
-
           if (!url || method !== "GET") return;
           if (!xhr.responseText) return;
 
-          // Приводим к абсолютному URL, чтобы проще матчить.
           const absUrl = new URL(url, location.origin).toString();
 
-          // 1) /api/Subjects/{subjectId}
           const mSubjects = absUrl.match(/\/api\/Subjects\/([^/?#]+)/i);
           if (mSubjects) {
             const subjectId = mSubjects[1];
@@ -585,15 +551,12 @@
             return;
           }
 
-          // 2) /api/SubjectsForm/{id} (форма ЖВП текущего визита)
           const mForm = absUrl.match(/\/api\/SubjectsForm\/([^/?#]+)/i);
           if (mForm) {
             const json = safeJsonParse(xhr.responseText);
             extractMeasurementsFromSubjectForm(json, {});
             return;
           }
-
-          // Остальное можно игнорировать.
         } catch (e) {
           console.error(logPrefix, "XHR load handler error", e);
         }
@@ -602,7 +565,6 @@
       return xhr;
     }
 
-    // Копируем статические свойства, чтобы не сломать сторонний код.
     for (const key in OriginalXHR) {
       if (Object.prototype.hasOwnProperty.call(OriginalXHR, key)) {
         WrappedXHR[key] = OriginalXHR[key];
@@ -615,13 +577,9 @@
   })();
 
   // ------------------------------------------------------
-  // 6. UI: подсказка под инпутом + попап с историей
+  // 6. UI: подписи и попапы под инпутами
   // ------------------------------------------------------
 
-  /**
-   * Вставляет под конкретный input маленький блок с последним значением
-   * и кнопкой "История".
-   */
   function injectHistoryUIForField(inputEl, fieldKey, fieldTitle, subjectId, currentVisitId) {
     if (!inputEl || !fieldKey || !subjectId) return;
 
@@ -631,7 +589,6 @@
     const allEntries = history[fieldKey] || [];
     if (!allEntries.length) return;
 
-    // Отфильтруем только предыдущие визиты
     const previousOnly = allEntries.filter(
       (e) => e.subjectVisitId && e.subjectVisitId !== currentVisitId
     );
@@ -639,7 +596,6 @@
 
     const latestPrev = previousOnly[0];
 
-    // Родительский контейнер вокруг инпута — ищем MUI-обертки.
     const wrapper =
       inputEl.closest(
         ".MuiFormControl-root, .MuiFormGroup-root, .MuiFormControlLabel-root, .MuiGrid-item"
@@ -647,12 +603,10 @@
 
     if (!wrapper) return;
 
-    // Обеспечим локальный контекст для абсолютного позиционирования попапа.
     if (getComputedStyle(wrapper).position === "static") {
       wrapper.style.position = "relative";
     }
 
-    // Если под этим полем уже есть наш блок — переиспользуем.
     let historyContainer = wrapper.querySelector(".vs-history-container");
     if (!historyContainer) {
       historyContainer = document.createElement("div");
@@ -667,7 +621,6 @@
       historyContainer.innerHTML = "";
     }
 
-    // --- Короткая подпись с последним значением ---
     const latestLine = document.createElement("div");
     latestLine.className = "vs-history-latest";
 
@@ -695,13 +648,11 @@
       metaText +
       (datePart ? ` ${datePart}` : "");
 
-    // --- Кнопка "История" ---
     const toggleBtn = document.createElement("button");
     toggleBtn.type = "button";
     toggleBtn.className = "vs-history-toggle-btn";
     toggleBtn.textContent = "История";
 
-    // --- Попап со всей историей ---
     const popup = document.createElement("div");
     popup.className = "vs-history-popup";
     popup.style.display = "none";
@@ -746,7 +697,6 @@
     historyContainer.appendChild(toggleBtn);
     historyContainer.appendChild(popup);
 
-    // Логика открытия/закрытия попапа
     let opened = false;
 
     function setOpened(value) {
@@ -759,7 +709,6 @@
       setOpened(!opened);
     });
 
-    // По клику вне попапа закрываем его
     document.addEventListener(
       "click",
       (e) => {
@@ -775,11 +724,6 @@
     );
   }
 
-  /**
-   * Ищем все инпуты формы, смотрим их fieldKey,
-   * и если в истории для этого субъекта что-то есть —
-   * подставляем UI.
-   */
   function scanAndInjectForAllFields() {
     const subjectVisitId = getCurrentSubjectVisitIdFromLocation();
     const subjectId = subjectVisitId && subjectIdByVisitId.get(subjectVisitId);
@@ -789,13 +733,9 @@
     if (!history) return;
 
     const currentVisitId = subjectVisitId;
-
     const knownFieldKeys = new Set(Object.keys(history));
+    if (!knownFieldKeys.size) return;
 
-    // Типичные варианты:
-    //  - [data-annotation-key="SAD"] внутри MUI-оберток
-    //  - <input data-annotation-key="SAD">
-    //  - <input name="SAD">
     const selectorParts = [];
     knownFieldKeys.forEach((fk) => {
       selectorParts.push(
@@ -804,18 +744,16 @@
         `input[name="${fk}"]`
       );
     });
-    if (!selectorParts.length) return;
-
     const inputs = document.querySelectorAll(selectorParts.join(","));
     inputs.forEach((inputEl) => {
       if (!inputEl || inputEl.__vsHistoryInjected) return;
+
       const fieldKey =
         inputEl.getAttribute("data-annotation-key") ||
         inputEl.name ||
         null;
       if (!fieldKey || !history[fieldKey]) return;
 
-      // Попробуем вытянуть подпись поля (label) из DOM
       let fieldTitle = fieldKey;
       const labelEl =
         inputEl.closest(".MuiFormControl-root")?.querySelector("label") ||
@@ -831,9 +769,6 @@
     });
   }
 
-  /**
-   * MutationObserver: реагируем на появление формы/инпутов.
-   */
   function setupMutationObserver() {
     const observer = new MutationObserver(() => {
       try {
@@ -848,24 +783,96 @@
       subtree: true
     });
 
-    // И один стартовый прогон
     setTimeout(scanAndInjectForAllFields, 2000);
   }
 
   // ------------------------------------------------------
-  // 7. Инициализация
+  // 7. Отслеживание смены URL (SPA)
   // ------------------------------------------------------
 
-  // Как только появится authHeaderValue — грузим контекст субъекта.
+  async function handleVisitChange() {
+    const newVisitId = getCurrentSubjectVisitIdFromLocation();
+    if (!newVisitId) {
+      currentVisitIdCache = null;
+      return;
+    }
+    if (newVisitId === currentVisitIdCache) {
+      return; // визит не изменился
+    }
+
+    log("Detected visit change:", currentVisitIdCache, "→", newVisitId);
+    currentVisitIdCache = newVisitId;
+
+    // Убираем старые контейнеры историй (иначе останутся "висячие" подписи)
+    document
+      .querySelectorAll(".vs-history-container")
+      .forEach((el) => el.remove());
+
+    // Сбрасывать __vsHistoryInjected на input'ах не нужно:
+    // новые DOM-ноды будут без этого флага, старые со временем уйдут.
+
+    if (!authHeaderValue) {
+      // как только появится токен, ensureSubjectContextLoaded все равно отработает
+      return;
+    }
+
+    try {
+      await ensureSubjectContextLoaded();
+      const subjectId = subjectIdByVisitId.get(newVisitId);
+      if (!subjectId) {
+        log("No subjectId for visit", newVisitId);
+        return;
+      }
+
+      await ensurePreviousVsLoadedForSubject(subjectId);
+
+      // После подгрузки истории — пробежаться по DOM и вставить подписи.
+      scanAndInjectForAllFields();
+    } catch (e) {
+      console.error(logPrefix, "handleVisitChange error:", e);
+    }
+  }
+
+  function installUrlWatcher() {
+    currentVisitIdCache = getCurrentSubjectVisitIdFromLocation();
+
+    const origPushState = history.pushState;
+    const origReplaceState = history.replaceState;
+
+    if (origPushState) {
+      history.pushState = function (...args) {
+        const res = origPushState.apply(this, args);
+        setTimeout(handleVisitChange, 0);
+        return res;
+      };
+    }
+
+    if (origReplaceState) {
+      history.replaceState = function (...args) {
+        const res = origReplaceState.apply(this, args);
+        setTimeout(handleVisitChange, 0);
+        return res;
+      };
+    }
+
+    window.addEventListener("popstate", () => {
+      setTimeout(handleVisitChange, 0);
+    });
+
+    log("URL watcher installed");
+  }
+
+  // ------------------------------------------------------
+  // 8. Инициализация
+  // ------------------------------------------------------
+
   whenAuthReady(() => {
     ensureSubjectContextLoaded()
       .then(() => {
         const currentVisitId = getCurrentSubjectVisitIdFromLocation();
         const subjectId = currentVisitId && subjectIdByVisitId.get(currentVisitId);
         if (subjectId) {
-          // Подгружаем данные прошлых визитов (ЖВП)
           ensurePreviousVsLoadedForSubject(subjectId).then(() => {
-            // После подгрузки есть смысл обновить UI
             scanAndInjectForAllFields();
           });
         }
@@ -875,8 +882,8 @@
       });
   });
 
-  // Стартуем наблюдение за DOM
   setupMutationObserver();
+  installUrlWatcher();
 
   log("VS Helper initialized");
 })();
