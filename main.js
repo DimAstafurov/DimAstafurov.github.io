@@ -1,508 +1,698 @@
 // main.js
-// Этот файл грузится с хостинга и выполняется в контексте страницы MIS.
-// Основная задача: найти форму "Жизненно-важные показатели", подтянуть последние
-// значения ЖВП из предыдущего завершённого визита и подсветить их под input'ами.
-
 (function () {
   const LOG_PREFIX = "[VS Helper]";
+  const API_BASE = "https://mis.ctcloud.ru";
+  const MAX_PREV_VISITS_TO_SCAN = 2; // ограничение нагрузки на API
+
   function log(...args) {
+    // Если надо выключить лог — просто закомментируй.
     console.log(LOG_PREFIX, ...args);
   }
 
-  // ==============================
-  // Глобальное состояние
-  // ==============================
+  // --- Глобальный стейт в контексте страницы ---
   const state = {
-    // Токен авторизации вида "Bearer xxx"
-    authHeader: null,
+    authToken: null,
+    lastAuthHeaderSeenAt: 0,
 
-    // subjectId -> { id, subjectVisitList: [...] } как возвращает /api/Subjects/{id}
-    subjectsById: {},
+    current: {
+      visitId: null,
+      subjectId: null,
+      visitDate: null,
+      visitIndex: null
+    },
 
-    // subjectId -> [{ id: subjectVisitId, visit: { index, title, ... }, date, ...}, ...]
-    subjectVisitsBySubjectId: {},
+    subjects: {
+      // subjectId: {
+      //   visitsMeta: [ { subjectVisitId, visitDate, visitIndex } ],
+      //   lastVs: {
+      //     subjectVisitId,
+      //     subjectFormId,
+      //     subjectFormSectionId,
+      //     loaded: false
+      //   }
+      // }
+    },
 
-    // subjectVisitId -> полный объект /api/SubjectsVisit/{id}
-    subjectVisitDetailsById: {},
+    vsHistory: {
+      // subjectId: {
+      //   [fieldKey]: {
+      //     value,
+      //     unit,
+      //     visitTitle,
+      //     visitDate,
+      //     timePoint,
+      //     capturedAt
+      //   }
+      // }
+    },
 
-    // subjectId -> { visitId, visitDate, vsForms: [...] }
-    lastVsHistoryBySubjectId: {},
-
-    // последний url, чтобы отслеживать SPA-навигацию
-    lastUrl: location.href,
+    lastUrl: location.href
   };
 
-  // ==============================
-  // Перехват XHR (чтобы достать Authorization и ответ /api/Subjects/*)
-  // ==============================
+  // =========================
+  // 1. Перехват XHR ради токена
+  // =========================
 
-  // ВНИМАНИЕ: этот код должен выполняться именно в контексте страницы, а не isolated world.
-  // Обычно расширение в content-script инжектит этот файл через <script src="...">.
+  function patchXMLHttpRequestForAuth() {
+    if (window.__vsHelperXhrPatched) return;
+    window.__vsHelperXhrPatched = true;
 
-  (function patchXHR() {
-    const origOpen = XMLHttpRequest.prototype.open;
-    const origSend = XMLHttpRequest.prototype.send;
-    const origSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+    const OriginalXHR = window.XMLHttpRequest;
 
-    XMLHttpRequest.prototype.open = function (method, url) {
-      this._vsMeta = this._vsMeta || {};
-      this._vsMeta.method = method;
-      this._vsMeta.url = url;
-      return origOpen.apply(this, arguments);
-    };
+    function WrappedXHR() {
+      const xhr = new OriginalXHR();
+      let url = null;
+      let method = null;
 
-    XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
-      // Поймаем Authorization, который кладёт само приложение MIS.
-      try {
-        if (name.toLowerCase() === "authorization" && value && value.startsWith("Bearer ")) {
-          if (state.authHeader !== value) {
-            state.authHeader = value;
-            log("Captured Authorization header");
-          }
-        }
-      } catch (e) {
-        // ignore
-      }
-      return origSetRequestHeader.apply(this, arguments);
-    };
+      const originalOpen = xhr.open;
+      xhr.open = function (m, u, async, user, password) {
+        method = m;
+        url = u;
+        return originalOpen.apply(xhr, arguments);
+      };
 
-    XMLHttpRequest.prototype.send = function () {
-      const xhr = this;
-      const url = (xhr._vsMeta && xhr._vsMeta.url) || "";
-
-      xhr.addEventListener("readystatechange", function () {
-        if (xhr.readyState !== 4) return;
-
+      const originalSetRequestHeader = xhr.setRequestHeader;
+      xhr.setRequestHeader = function (name, value) {
         try {
-          // Интересуют только успешные ответы JSON
-          if (xhr.status >= 200 && xhr.status < 300) {
-            // /api/Subjects/{id} -> список визитов субъекта
-            const subjMatch = url.match(/\/api\/Subjects\/([0-9a-fA-F-]+)\b/);
-            if (subjMatch) {
-              const subjectId = subjMatch[1];
-              try {
-                const respText = xhr.responseText;
-                if (!respText) return;
-                const json = JSON.parse(respText);
-                handleSubjectResponse(subjectId, json);
-              } catch (e) {
-                log("Failed to parse /api/Subjects response", e);
-              }
-              return;
-            }
-
-            // /api/SubjectsVisit/{id} -> детали конкретного визита
-            const visitMatch = url.match(/\/api\/SubjectsVisit\/([0-9a-fA-F-]+)\b/);
-            if (visitMatch) {
-              const subjectVisitId = visitMatch[1];
-              try {
-                const respText = xhr.responseText;
-                if (!respText) return;
-                const json = JSON.parse(respText);
-                handleSubjectVisitResponse(subjectVisitId, json);
-              } catch (e) {
-                log("Failed to parse /api/SubjectsVisit response", e);
-              }
-              return;
-            }
+          if (name && typeof name === "string" &&
+              name.toLowerCase() === "authorization" &&
+              typeof value === "string" &&
+              value.startsWith("Bearer ")) {
+            state.authToken = value;
+            state.lastAuthHeaderSeenAt = Date.now();
+            //log("Captured auth token from XHR");
           }
         } catch (e) {
-          log("XHR onreadystatechange error", e);
+          console.warn(LOG_PREFIX, "Error capturing Authorization header", e);
         }
-      });
+        return originalSetRequestHeader.apply(xhr, arguments);
+      };
 
-      return origSend.apply(this, arguments);
-    };
+      // Если вдруг захочешь ловить ответные данные VS через XHR —
+      // здесь можно добавить xhr.addEventListener('load', ...) и парсить JSON.
+      // Сейчас это не требуется для работы алгоритма, т.к. мы сами дергаем API.
 
-    log("XHR patched");
-  })();
-
-  // ==============================
-  // Обработка /api/Subjects/{id}
-  // ==============================
-
-  function handleSubjectResponse(subjectId, json) {
-    if (!json || !json.data) return;
-    const subject = json.data;
-    state.subjectsById[subjectId] = subject;
-    const visits = subject.subjectVisitList || [];
-    state.subjectVisitsBySubjectId[subjectId] = visits;
-    log(
-      "Stored visits for subject",
-      subjectId,
-      "count:",
-      visits.length
-    );
-
-    // Как только получили список визитов — можно попытаться подтянуть историю VS
-    // для текущей страницы, если мы стоим на форме ЖВП.
-    debouncedScan();
-  }
-
-  // ==============================
-  // Обработка /api/SubjectsVisit/{subjectVisitId}
-  // ==============================
-
-  function handleSubjectVisitResponse(subjectVisitId, json) {
-    if (!json || !json.data) return;
-    const data = json.data;
-    state.subjectVisitDetailsById[subjectVisitId] = data;
-    const forms = data.subjectFormList || [];
-    log("Stored subjectVisit", subjectVisitId, "forms:", forms.length);
-  }
-
-  // ==============================
-  // Вспомогательные функции для URL/ID
-  // ==============================
-
-  // /subjectVisit/{subjectVisitId}/...
-  function getCurrentSubjectVisitIdFromLocation() {
-    const m = location.pathname.match(/\/subjectVisit\/([0-9a-fA-F-]+)/);
-    return m ? m[1] : null;
-  }
-
-  // Из ответа /api/SubjectsVisit/{id} мы получаем subject.id
-  function getSubjectIdFromSubjectVisit(subjectVisitId) {
-    const details = state.subjectVisitDetailsById[subjectVisitId];
-    if (!details || !details.subject || !details.subject.id) return null;
-    return details.subject.id;
-  }
-
-  // ==============================
-  // Загруженный визит по ID (если не был перехвачен XHR)
-  // ==============================
-
-  async function ensureSubjectVisitLoaded(subjectVisitId) {
-    if (!subjectVisitId) return null;
-    if (state.subjectVisitDetailsById[subjectVisitId]) {
-      return state.subjectVisitDetailsById[subjectVisitId];
+      return xhr;
     }
 
-    if (!state.authHeader) {
-      log("ensureSubjectVisitLoaded: no authHeader yet");
-      return null;
-    }
+    WrappedXHR.prototype = OriginalXHR.prototype;
+    window.XMLHttpRequest = WrappedXHR;
 
-    const url = `/api/SubjectsVisit/${subjectVisitId}`;
-    log("ensureSubjectVisitLoaded: fetching", url);
+    log("XMLHttpRequest patched for Authorization header capture");
+  }
+
+  // =========================
+  // 2. Хелперы для API
+  // =========================
+
+  async function waitForAuthToken(timeoutMs = 15000) {
+    const start = Date.now();
+    while (!state.authToken && Date.now() - start < timeoutMs) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    if (!state.authToken) {
+      log("No auth token captured within timeout");
+      throw new Error("Authorization token not available");
+    }
+  }
+
+  async function fetchJsonWithAuth(path, options = {}) {
+    await waitForAuthToken();
+    const url = path.startsWith("http") ? path : API_BASE + path;
+
+    const headers = new Headers(options.headers || {});
+    if (!headers.has("accept")) {
+      headers.set("accept", "application/json, text/plain, */*");
+    }
+    if (!headers.has("authorization")) {
+      headers.set("authorization", state.authToken);
+    }
+    // немного мимикрируем под обычные запросы
+    headers.set("cache-control", "no-cache");
+    headers.set("pragma", "no-cache");
 
     const resp = await fetch(url, {
-      method: "GET",
+      method: options.method || "GET",
+      headers,
       credentials: "include",
-      headers: {
-        "accept": "application/json, text/plain, */*",
-        "authorization": state.authHeader,
-      },
+      body: options.body || null
     });
 
     if (!resp.ok) {
-      log("ensureSubjectVisitLoaded: fetch failed", resp.status);
-      return null;
+      const text = await resp.text().catch(() => "");
+      log("fetchJsonWithAuth error", resp.status, resp.statusText, text.slice(0, 200));
+      throw new Error(`HTTP ${resp.status} for ${path}`);
     }
 
-    const text = await resp.text();
-    if (!text) {
-      log("ensureSubjectVisitLoaded: empty response body for", subjectVisitId);
-      return null;
+    const ct = resp.headers.get("content-type") || "";
+    if (!ct.includes("application/json")) {
+      const text = await resp.text().catch(() => "");
+      log("fetchJsonWithAuth non-JSON response", text.slice(0, 200));
+      throw new Error("Non-JSON response");
     }
 
-    let json;
     try {
-      json = JSON.parse(text);
+      return await resp.json();
     } catch (e) {
-      log("ensureSubjectVisitLoaded: JSON parse error", e);
-      return null;
+      log("fetchJsonWithAuth JSON parse error", e);
+      throw e;
     }
-
-    if (!json || !json.data) {
-      log("ensureSubjectVisitLoaded: no data field");
-      return null;
-    }
-
-    state.subjectVisitDetailsById[subjectVisitId] = json.data;
-    const forms = json.data.subjectFormList || [];
-    log("Stored subjectVisit", subjectVisitId, "forms:", forms.length);
-
-    return json.data;
   }
 
-  // ==============================
-  // Определение VS-формы
-  // ==============================
+  // =========================
+  // 3. Определение текущего визита
+  // =========================
 
-  /**
-   * Проверяет, является ли объект subjectForm формой "Жизненно-важные показатели".
-   * Работает с реальной структурой MIS:
-   * subjectForm.form.formType.formTypeKey === "VS"
-   *   ИЛИ
-   * title содержит "Жизненно-важные показатели"
-   */
-  function isVsSubjectForm(sf) {
-    if (!sf) return false;
-
-    // Реальная структура: sf.form.formType.formTypeKey
-    const form = sf.form || {};
-    const formType = form.formType || sf.formType || {};
-
-    const title =
-      form.title ||
-      formType.title ||
-      sf.title ||
-      "";
-
-    const keyRaw =
-      formType.formTypeKey ||
-      formType.key ||
-      formType.code ||
-      form.formKey ||
-      form.key ||
-      form.code;
-
-    const key = keyRaw ? String(keyRaw).toUpperCase() : "";
-
-    const byKey = key === "VS";
-    const byTitle = /Жизненно-важные показатели/i.test(title);
-
-    return byKey || byTitle;
+  function parseSubjectVisitIdFromUrl(url) {
+    // URL-и вида:
+    //  - https://mis.ctcloud.ru/subjectVisit/<subjectVisitId>
+    //  - https://mis.ctcloud.ru/subjectVisit/<subjectVisitId>/timePoints
+    const m = url.match(/\/subjectVisit\/([0-9a-fA-F-]+)/);
+    return m ? m[1] : null;
   }
 
-  // ==============================
-  // Загрузка "последней истории ЖВП"
-  // ==============================
-
-  /**
-   * Загружает и кэширует последнюю историю ЖВП по subjectId,
-   * используя только ОДИН последний предыдущий визит, в котором есть форма VS.
-   *
-   * @param {string} subjectId
-   * @param {string} currentVisitId - id текущего визита (чтобы его не считать "предыдущим")
-   */
-  async function ensureLastVsHistoryLoaded(subjectId, currentVisitId) {
-    if (!subjectId) {
-      log("ensureLastVsHistoryLoaded: no subjectId");
-      return null;
+  async function ensureCurrentContext() {
+    const visitId = parseSubjectVisitIdFromUrl(location.href);
+    if (!visitId) {
+      // Не страница визита — нам тут делать нечего
+      return false;
     }
 
-    // Если уже кэшировали — просто вернём
-    if (state.lastVsHistoryBySubjectId[subjectId]) {
-      return state.lastVsHistoryBySubjectId[subjectId];
+    if (state.current.visitId === visitId && state.current.subjectId) {
+      return true;
     }
 
-    const visits = state.subjectVisitsBySubjectId[subjectId] || [];
-    if (!visits.length) {
-      log("ensureLastVsHistoryLoaded: subject has no visits", subjectId);
-      return null;
+    log("Loading current SubjectVisit", visitId);
+
+    const json = await fetchJsonWithAuth(`/api/SubjectsVisit/${visitId}`);
+    const data = json && json.data;
+    if (!data || !data.subject) {
+      log("No subject in SubjectsVisit response");
+      return false;
     }
 
-    // Отсортируем визиты по дате/индексу, чтобы идти от последнего к первому.
-    // В ответе /api/Subjects/{id} обычно есть:
-    //  - date
-    //  - visit.index
-    const sorted = [...visits].sort((a, b) => {
-      const da = new Date(a.date || 0).getTime();
-      const db = new Date(b.date || 0).getTime();
-      if (da !== db) return da - db;
-      const ia = (a.visit && a.visit.index) || 0;
-      const ib = (b.visit && b.visit.index) || 0;
-      return ia - ib;
+    const subjectId = data.subject.id;
+    const visitDate = data.date ? new Date(data.date) : null;
+    const visitIndex = data.visit && typeof data.visit.index === "number"
+      ? data.visit.index
+      : null;
+
+    state.current.visitId = visitId;
+    state.current.subjectId = subjectId;
+    state.current.visitDate = visitDate;
+    state.current.visitIndex = visitIndex;
+
+    log("Current context:", {
+      visitId,
+      subjectId,
+      visitDate,
+      visitIndex
     });
 
-    // Пойдём с конца (последние визиты -> к более ранним)
-    let lastVsVisit = null;
-    for (let i = sorted.length - 1; i >= 0; i--) {
-      const v = sorted[i];
-      const svId = v.id;
+    return true;
+  }
 
-      // Текущий визит (на котором сейчас стоят) пропускаем, нам нужен предыдущий
-      if (svId === currentVisitId) continue;
+  // =========================
+  // 4. Загрузка визитов субъекта
+  // =========================
 
-      // Подгружаем детали визита (если ещё не перехватили XHR)
-      const details = await ensureSubjectVisitLoaded(svId);
-      if (!details) continue;
+  async function ensureSubjectVisitsLoaded(subjectId) {
+    if (!subjectId) return;
 
-      const forms = details.subjectFormList || [];
-      const vsForms = forms.filter(isVsSubjectForm);
+    if (state.subjects[subjectId] && state.subjects[subjectId].visitsMeta) {
+      return;
+    }
 
-      log(
-        "ensureLastVsHistoryLoaded: visit",
-        svId,
-        "title:",
-        v.visit && v.visit.title,
-        "VS forms count:",
-        vsForms.length
-      );
+    log("Loading subject visits for", subjectId);
 
-      if (vsForms.length > 0) {
-        lastVsVisit = { visit: v, visitDetails: details, vsForms };
-        break; // НАЙДЕН последний предыдущий визит с ЖВП — дальше не идём
+    const json = await fetchJsonWithAuth(`/api/Subjects/${subjectId}`);
+    const data = json && json.data;
+    if (!data || !Array.isArray(data.subjectVisitList)) {
+      log("Subjects response has no subjectVisitList");
+      state.subjects[subjectId] = state.subjects[subjectId] || {};
+      state.subjects[subjectId].visitsMeta = [];
+      return;
+    }
+
+    const visitsMeta = data.subjectVisitList.map((sv) => {
+      const v = sv.visit || {};
+      return {
+        subjectVisitId: sv.id,
+        visitDate: sv.date ? new Date(sv.date) : null,
+        visitIndex: typeof v.index === "number" ? v.index : null,
+        visitTitle: v.title || "",
+        visitKey: v.visitKey || ""
+      };
+    });
+
+    state.subjects[subjectId] = state.subjects[subjectId] || {};
+    state.subjects[subjectId].visitsMeta = visitsMeta;
+
+    log("Stored visits for subject", subjectId, "visits:", visitsMeta.length);
+  }
+
+  // =========================
+  // 5. Поиск последнего визита с ЖВП
+  // =========================
+
+  function selectPreviousVisits(subjectId) {
+    const subj = state.subjects[subjectId];
+    if (!subj || !Array.isArray(subj.visitsMeta)) return [];
+
+    const currentVisitId = state.current.visitId;
+    const currentDate = state.current.visitDate;
+    const currentIndex = state.current.visitIndex;
+
+    const candidates = subj.visitsMeta
+      .filter((v) => v.subjectVisitId !== currentVisitId)
+      .map((v) => ({
+        ...v,
+        _cmpDate: v.visitDate ? v.visitDate.getTime() : 0,
+        _cmpIndex: typeof v.visitIndex === "number" ? v.visitIndex : -9999
+      }));
+
+    // сортируем по дате/индексу убыванию — от самых поздних к более ранним
+    candidates.sort((a, b) => {
+      if (a._cmpDate !== b._cmpDate) return b._cmpDate - a._cmpDate;
+      return b._cmpIndex - a._cmpIndex;
+    });
+
+    // фильтруем только те, что реально "раньше" текущего
+    const filtered = candidates.filter((v) => {
+      if (!currentDate) return true; // если дата текущего неизвестна — оставляем всё
+      if (!v.visitDate) return false;
+      if (v.visitDate.getTime() < currentDate.getTime()) return true;
+      if (v.visitDate.getTime() > currentDate.getTime()) return false;
+      // если даты равны — сравниваем index (меньший index считаем более ранним)
+      if (currentIndex == null || v.visitIndex == null) return false;
+      return v.visitIndex < currentIndex;
+    });
+
+    return filtered;
+  }
+
+  async function ensureLastVsVisitLoaded(subjectId) {
+    if (!subjectId) return;
+
+    const subj = (state.subjects[subjectId] = state.subjects[subjectId] || {});
+    if (subj.lastVs && subj.lastVs.loaded) {
+      return;
+    }
+
+    const prevVisits = selectPreviousVisits(subjectId);
+    if (!prevVisits.length) {
+      log("Subject has no previous visits", subjectId);
+      subj.lastVs = { loaded: true, subjectVisitId: null };
+      return;
+    }
+
+    // смотрим только первые N предыдущих визитов, чтобы не грохать API
+    const limited = prevVisits.slice(0, MAX_PREV_VISITS_TO_SCAN);
+
+    log(
+      "Scanning previous visits for last VS",
+      subjectId,
+      "candidates:",
+      limited.map((v) => v.subjectVisitId)
+    );
+
+    for (const v of limited) {
+      const subjectVisitId = v.subjectVisitId;
+      try {
+        const json = await fetchJsonWithAuth(`/api/SubjectsVisit/${subjectVisitId}`);
+        const data = json && json.data;
+        if (!data || !Array.isArray(data.subjectFormList)) {
+          continue;
+        }
+
+        // Ищем форму ЖВП
+        const vsForm = data.subjectFormList.find((sf) => {
+          if (sf.isDeleted) return false;
+          const form = sf.form || {};
+          const formType = form.formType || {};
+          const formKey = form.formKey || "";
+          const formTypeKey = formType.formTypeKey || "";
+          const title = (form.title || "").toLowerCase();
+
+          const looksLikeVS =
+            formTypeKey === "VS" ||
+            formKey === "F_VS" ||
+            title.includes("жизненно-важные показател");
+
+          const isComplete = !!sf.isComplete;
+
+          return looksLikeVS && isComplete;
+        });
+
+        if (!vsForm) {
+          continue;
+        }
+
+        // Внутри есть subjectFormSectionList, там секции типа FS_VS_0
+        const vsSection = Array.isArray(data.subjectFormSectionList)
+          ? data.subjectFormSectionList.find((s) => {
+              if (!s.subjectForm) return false;
+              return s.subjectForm.id === vsForm.id;
+            })
+          : null;
+
+        if (!vsSection) {
+          log(
+            "Found VS form but no matching section in subjectFormSectionList",
+            subjectVisitId
+          );
+          continue;
+        }
+
+        const lastVs = {
+          subjectVisitId,
+          subjectFormId: vsForm.id,
+          subjectFormSectionId: vsSection.id,
+          loaded: false,
+          visitTitle: (data.visit && data.visit.title) || v.visitTitle || "",
+          visitDate: data.date ? new Date(data.date) : v.visitDate
+        };
+
+        subj.lastVs = lastVs;
+
+        log("Found last VS visit", {
+          subjectId,
+          lastVs
+        });
+
+        // подгружаем поля ЖВП для этой секции
+        await loadVsFieldsForSection(subjectId, lastVs);
+
+        lastVs.loaded = true;
+        return;
+      } catch (e) {
+        console.warn(LOG_PREFIX, "ensureLastVsVisitLoaded error for visit", subjectVisitId, e);
       }
     }
 
-    if (!lastVsVisit) {
-      log(
-        "No previous visit with VS found for subject",
-        subjectId,
-        "current visit",
-        currentVisitId
-      );
-      state.lastVsHistoryBySubjectId[subjectId] = null;
-      return null;
+    log("No previous visit with VS found for subject", subjectId);
+    subj.lastVs = { loaded: true, subjectVisitId: null };
+  }
+
+  // =========================
+  // 6. Загрузка полей ЖВП (последний визит)
+  // =========================
+
+  async function loadVsFieldsForSection(subjectId, lastVs) {
+    if (!lastVs || !lastVs.subjectFormSectionId) return;
+
+    const sectionId = lastVs.subjectFormSectionId;
+
+    // ВАЖНО:
+    // Ниже — предположение по API:
+    //   GET /api/SubjectFormSection/{id}
+    // должен вернуть data.subjectFormFieldList с полями, где есть fieldKey и value.
+    //
+    // Проверь в devtools:
+    //   - открой любую форму ЖВП
+    //   - посмотри XHR, находящийся рядом с SubjectFormSection
+    //   - если путь отличается — поправь только этот endpoint и разбор полей.
+
+    log("Loading VS fields for section", sectionId);
+
+    const json = await fetchJsonWithAuth(`/api/SubjectsForm/${sectionId}`);
+    const data = json && json.data;
+    if (!data || !Array.isArray(data.subjectFormFieldList)) {
+      log("SubjectFormSection has no subjectFormFieldList", sectionId);
+      return;
     }
 
-    const result = {
-      visitId: lastVsVisit.visit.id,
-      visitDate: lastVsVisit.visit.date,
-      visitTitle: lastVsVisit.visit.visit && lastVsVisit.visit.visit.title,
-      vsForms: lastVsVisit.vsForms,
-    };
+    const subjectHistory = (state.vsHistory[subjectId] = state.vsHistory[subjectId] || {});
 
-    state.lastVsHistoryBySubjectId[subjectId] = result;
+    for (const f of data.subjectFormFieldList) {
+      const formField = f.formField || {};
+      const key =
+        f.formFieldKey ||
+        formField.formFieldKey ||
+        formField.fieldKey ||
+        formField.key ||
+        null;
+
+      if (!key) continue;
+
+      // Значение может быть в разных полях. Ниже — типичный вариант,
+      // возможно, надо будет подправить под конкретный JSON:
+      const rawValue =
+        f.value ??
+        f.valueString ??
+        f.valueNumber ??
+        f.valueDecimal ??
+        f.valueInt ??
+        null;
+
+      if (rawValue == null || rawValue === "") {
+        continue;
+      }
+
+      const unit =
+        f.unit ||
+        (formField.unit && formField.unit.title) ||
+        null;
+
+      const timePoint =
+        (f.timePoint && f.timePoint.title) ||
+        (f.timePointTitle) ||
+        null;
+
+      subjectHistory[key] = {
+        value: rawValue,
+        unit: unit,
+        visitTitle: lastVs.visitTitle || "",
+        visitDate: lastVs.visitDate || null,
+        timePoint: timePoint,
+        capturedAt: new Date()
+      };
+    }
 
     log(
-      "ensureLastVsHistoryLoaded: found last previous VS visit",
-      result.visitId,
-      "date:",
-      result.visitDate,
-      "title:",
-      result.visitTitle
+      "Stored VS fields for subject",
+      subjectId,
+      "fields:",
+      Object.keys(subjectHistory)
     );
-
-    return result;
   }
 
-  // ==============================
-  // Инъекция подсказок в DOM (VS-форма)
-  // ==============================
+  // =========================
+  // 7. Инъекция подсказок в DOM
+  // =========================
 
-  /**
-   * Здесь — упрощённая версия: мы не привязываемся к конкретной структуре таблицы,
-   * а ищем input'ы внутри формы "Жизненно-важные показатели" и под каждым
-   * рисуем маленький текст "Предыдущее значение: ...".
-   *
-   * В реальности у тебя это уже есть — можешь оставить свою реализацию,
-   * а из этого файла использовать только часть с history.
-   */
-  function injectVsHints(history) {
-    if (!history || !history.vsForms || !history.vsForms.length) return;
-
-    // TODO: здесь маппинг полей, как в твоей рабочей версии:
-    // (this is just a placeholder to keep file self-contained)
-    log("injectVsHints: history found, but DOM injection is placeholder");
+  function formatDateTime(d) {
+    if (!(d instanceof Date) || Number.isNaN(d.getTime())) return "";
+    const dd = String(d.getDate()).padStart(2, "0");
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const yyyy = d.getFullYear();
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mi = String(d.getMinutes()).padStart(2, "0");
+    return `${dd}.${mm}.${yyyy} ${hh}:${mi}`;
   }
 
-  // ==============================
-  // Основной проход: найти subjectId, загрузить историю ЖВП, внедрить в DOM
-  // ==============================
+  function attachHintToField(inputEl, fieldKey) {
+    const subjectId = state.current.subjectId;
+    if (!subjectId) return;
 
-  async function scanAndInjectForAllFields() {
-    const subjectVisitId = getCurrentSubjectVisitIdFromLocation();
-    if (!subjectVisitId) {
-      log("scanAndInjectForAllFields: no subjectVisitId in URL");
+    const subjectHistory = state.vsHistory[subjectId];
+    const entry = subjectHistory && subjectHistory[fieldKey];
+
+    let container = inputEl.parentElement.querySelector(
+      ".vs-helper-container[data-field-key='" + fieldKey + "']"
+    );
+    if (!container) {
+      container = document.createElement("div");
+      container.className = "vs-helper-container";
+      container.dataset.fieldKey = fieldKey;
+      // вставляем сразу после input-а
+      if (inputEl.nextSibling) {
+        inputEl.parentElement.insertBefore(container, inputEl.nextSibling);
+      } else {
+        inputEl.parentElement.appendChild(container);
+      }
+    } else {
+      container.innerHTML = "";
+    }
+
+    const labelSpan = document.createElement("span");
+    labelSpan.className = "vs-helper-label";
+
+    if (!entry) {
+      labelSpan.textContent = "Предыдущие ЖВП: данных нет.";
+      container.appendChild(labelSpan);
       return;
     }
 
-    const currentVisitDetails = await ensureSubjectVisitLoaded(subjectVisitId);
-    if (!currentVisitDetails) {
-      log("scanAndInjectForAllFields: cannot load current subjectVisit", subjectVisitId);
-      return;
+    labelSpan.textContent = "Предыдущее значение: ";
+
+    const valueSpan = document.createElement("span");
+    valueSpan.className = "vs-helper-value";
+    valueSpan.textContent =
+      entry.value + (entry.unit ? " " + entry.unit : "");
+
+    const metaSpan = document.createElement("span");
+    metaSpan.className = "vs-helper-meta";
+
+    const parts = [];
+    if (entry.visitTitle) parts.push(entry.visitTitle);
+    if (entry.visitDate) parts.push(formatDateTime(entry.visitDate));
+    if (entry.timePoint) parts.push(entry.timePoint);
+
+    if (parts.length) {
+      metaSpan.textContent = " (" + parts.join(", ") + ")";
     }
 
-    const subjectId =
-      (currentVisitDetails.subject && currentVisitDetails.subject.id) ||
-      getSubjectIdFromSubjectVisit(subjectVisitId);
+    container.appendChild(labelSpan);
+    container.appendChild(valueSpan);
+    container.appendChild(metaSpan);
 
-    if (!subjectId) {
-      log(
-        "scanAndInjectForAllFields: no subjectId for current visit",
-        subjectVisitId
-      );
-      return;
+    // Кнопка истории — пока показывает только последний визит,
+    // но интерфейс готов, если захочешь докрутить массив значений
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "vs-helper-btn-history";
+    btn.textContent = "история";
+
+    let popup = null;
+
+    function closePopup() {
+      if (popup && popup.parentElement) {
+        popup.parentElement.removeChild(popup);
+      }
+      popup = null;
+      document.removeEventListener("click", onDocClick, true);
     }
 
-    // Если мы ещё не знаем список визитов этого субъекта — его когда-то должен
-    // был загрузить экран "Визиты" через /api/Subjects/{subjectId}. Если нет,
-    // то без списка визитов мы не сможем найти предыдущий.
-    if (!state.subjectVisitsBySubjectId[subjectId]) {
-      log(
-        "scanAndInjectForAllFields: no visits array for subject yet",
-        subjectId,
-        "- wait until /api/Subjects/{id} is called"
-      );
-      return;
+    function onDocClick(e) {
+      if (!popup) return;
+      if (!popup.contains(e.target) && e.target !== btn) {
+        closePopup();
+      }
     }
 
-    const history = await ensureLastVsHistoryLoaded(subjectId, subjectVisitId);
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (popup) {
+        closePopup();
+        return;
+      }
 
-    if (!history || !history.vsForms || !history.vsForms.length) {
-      log(
-        "scanAndInjectForAllFields: history is empty for subject",
-        subjectId
-      );
-      return;
-    }
+      popup = document.createElement("div");
+      popup.className = "vs-helper-popup";
 
-    injectVsHints(history);
+      const ul = document.createElement("ul");
+      const li = document.createElement("li");
+      li.textContent =
+        "Последний визит: " +
+        (entry.visitTitle || "без названия") +
+        (entry.visitDate ? " — " + formatDateTime(entry.visitDate) : "") +
+        (entry.timePoint ? " — " + entry.timePoint : "");
+      ul.appendChild(li);
+      popup.appendChild(ul);
+
+      // позиционируем рядом с кнопкой
+      const rect = btn.getBoundingClientRect();
+      popup.style.left = rect.left + window.scrollX + "px";
+      popup.style.top = rect.bottom + window.scrollY + 4 + "px";
+
+      document.body.appendChild(popup);
+      document.addEventListener("click", onDocClick, true);
+    });
+
+    container.appendChild(btn);
   }
 
-  // ==============================
-  // Отслеживание SPA-навигации (изменение URL без перезагрузки)
-  // ==============================
+  function scanAndInjectForAllFields() {
+    const subjectId = state.current.subjectId;
+    if (!subjectId) return;
 
-  function observeUrlChanges() {
-    // Переопределяем pushState/replaceState
-    const origPushState = history.pushState;
-    const origReplaceState = history.replaceState;
-
-    function handleUrlChange() {
-      const current = location.href;
-      if (current === state.lastUrl) return;
-      const prev = state.lastUrl;
-      state.lastUrl = current;
-      log("URL changed", prev, "->", current);
-      debouncedScan();
+    const subjectHistory = state.vsHistory[subjectId];
+    if (!subjectHistory || !Object.keys(subjectHistory).length) {
+      log("scanAndInjectForAllFields: history is empty for subject", subjectId);
+      return;
     }
 
-    history.pushState = function () {
-      const res = origPushState.apply(this, arguments);
-      handleUrlChange();
-      return res;
-    };
+    // Предполагаем, что у контейнера поля есть data-field-key,
+    // которое совпадает с fieldKey в API.
+    // Если в DOM оно висит, например, на обертке — подправь селектор.
+    const fieldContainers = document.querySelectorAll("[data-field-key]");
 
-    history.replaceState = function () {
-      const res = origReplaceState.apply(this, arguments);
-      handleUrlChange();
-      return res;
-    };
+    fieldContainers.forEach((container) => {
+      const fieldKey = container.getAttribute("data-field-key");
+      if (!fieldKey) return;
 
-    window.addEventListener("popstate", handleUrlChange);
+      const input = container.querySelector("input, textarea, select");
+      if (!input) return;
+
+      attachHintToField(input, fieldKey);
+    });
   }
 
-  // ==============================
-  // debounce для повторных сканов
-  // ==============================
+  // =========================
+  // 8. Отслеживание смены URL (SPA)
+  // =========================
 
-  let scanTimer = null;
-  function debouncedScan() {
-    if (scanTimer) clearTimeout(scanTimer);
-    scanTimer = setTimeout(() => {
-      scanTimer = null;
-      scanAndInjectForAllFields().catch((e) =>
-        log("scanAndInjectForAllFields error", e)
-      );
-    }, 500);
+  function startUrlWatcher() {
+    setInterval(async () => {
+      const currentUrl = location.href;
+      if (currentUrl === state.lastUrl) return;
+      state.lastUrl = currentUrl;
+
+      try {
+        await mainFlow();
+      } catch (e) {
+        console.warn(LOG_PREFIX, "Error in mainFlow after URL change", e);
+      }
+    }, 1000);
   }
 
-  // ==============================
-  // Старт
-  // ==============================
+  // =========================
+  // 9. Основной сценарий
+  // =========================
+
+  async function mainFlow() {
+    // 1) убедились, что можем поймать токен
+    await waitForAuthToken();
+
+    // 2) определяем текущий визит/субъект
+    const ok = await ensureCurrentContext();
+    if (!ok) return;
+
+    const subjectId = state.current.subjectId;
+    if (!subjectId) return;
+
+    // 3) загружаем список визитов субъекта (один раз)
+    await ensureSubjectVisitsLoaded(subjectId);
+
+    // 4) ищем последний визит с ЖВП и подгружаем его значения (один раз)
+    await ensureLastVsVisitLoaded(subjectId);
+
+    // 5) сканируем DOM и подставляем подсказки
+    scanAndInjectForAllFields();
+  }
+
+  // =========================
+  // 10. Инициализация
+  // =========================
 
   function init() {
-    log("init");
-    observeUrlChanges();
-    // Первичный запуск на уже загруженной странице
-    debouncedScan();
+    try {
+      patchXMLHttpRequestForAuth();
+      startUrlWatcher();
+
+      // Первый запуск сразу
+      mainFlow().catch((e) => {
+        console.warn(LOG_PREFIX, "Error in initial mainFlow", e);
+      });
+    } catch (e) {
+      console.error(LOG_PREFIX, "Fatal init error", e);
+    }
   }
 
-  // Даём странице чуть-чуть времени, чтобы XHR-патч точно встал до первых запросов
-  setTimeout(init, 1000);
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
 })();
