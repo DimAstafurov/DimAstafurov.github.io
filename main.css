@@ -1,0 +1,74 @@
+/* vs-history.css
+   Небольшой unobtrusive UI под полями формы.
+*/
+
+.vs-history-container {
+  font-size: 11px;
+  color: #555;
+  margin-top: 2px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.vs-history-latest {
+  opacity: 0.85;
+}
+
+.vs-history-toggle-btn {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  background: rgba(255, 255, 255, 0.9);
+  cursor: pointer;
+  line-height: 1.2;
+}
+
+.vs-history-toggle-btn:hover {
+  background: rgba(245, 245, 245, 0.95);
+}
+
+/* Попап со списком прошлых значений */
+.vs-history-popup {
+  position: absolute;
+  z-index: 9999;
+  margin-top: 4px;
+  padding: 6px 8px;
+  background: #ffffff;
+  border-radius: 4px;
+  min-width: 260px;
+  max-width: 360px;
+  max-height: 220px;
+  overflow-y: auto;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  box-sizing: border-box;
+}
+
+.vs-history-popup-title {
+  font-size: 11px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.vs-history-popup-row {
+  display: flex;
+  flex-direction: column;
+  padding: 3px 0;
+  border-top: 1px solid rgba(0, 0, 0, 0.05);
+}
+
+.vs-history-popup-row:first-of-type {
+  border-top: none;
+}
+
+.vs-history-popup-row-main {
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.vs-history-popup-row-meta {
+  font-size: 10px;
+  opacity: 0.8;
+}
