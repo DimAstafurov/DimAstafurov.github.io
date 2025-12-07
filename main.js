@@ -132,11 +132,11 @@
     );
   }
 
+  // ---- ИСПРАВЛЕНО: устойчивый парсинг JSON для Subject ----
   async function ensureSubjectLoaded(subjectId, baseUrl) {
     if (!subjectId) return null;
 
     const cached = subjectCache.get(subjectId);
-    // Если уже есть "нормальный" объект с визитами — используем
     if (
       cached &&
       cached.raw &&
@@ -146,17 +146,36 @@
       return cached;
     }
 
-    // Иначе — всё равно грузим /api/Subjects/{id}
     try {
       log("ensureSubjectLoaded: fetching /api/Subjects/", subjectId);
       const resp = await fetch(`${baseUrl}/api/Subjects/${subjectId}`, {
         credentials: "include",
       });
-      const json = await resp.json();
-      if (!json || !json.data) {
-        warn("ensureSubjectLoaded: empty data for subject", subjectId);
+
+      if (!resp.ok) {
+        warn(
+          "ensureSubjectLoaded: non-OK response",
+          resp.status,
+          resp.statusText
+        );
         return null;
       }
+
+      const text = await resp.text();
+      if (!text || !text.trim()) {
+        warn(
+          "ensureSubjectLoaded: empty response body for subject",
+          subjectId
+        );
+        return null;
+      }
+
+      const json = safeJsonParse(text);
+      if (!json || !json.data) {
+        warn("ensureSubjectLoaded: no data in JSON for subject", subjectId);
+        return null;
+      }
+
       onSubjectsResponse(subjectId, json.data);
       return subjectCache.get(subjectId) || null;
     } catch (e) {
@@ -165,6 +184,7 @@
     }
   }
 
+  // ---- ИСПРАВЛЕНО: устойчивый парсинг JSON для SubjectVisit ----
   async function ensureSubjectVisitLoaded(subjectVisitId, baseUrl) {
     if (!subjectVisitId) return null;
     if (subjectVisitCache.has(subjectVisitId)) {
@@ -182,14 +202,33 @@
           credentials: "include",
         }
       );
-      const json = await resp.json();
-      if (!json || !json.data) {
+
+      if (!resp.ok) {
         warn(
-          "ensureSubjectVisitLoaded: empty data for visit",
+          "ensureSubjectVisitLoaded: non-OK response",
+          resp.status,
+          resp.statusText,
+          "for visit",
           subjectVisitId
         );
         return null;
       }
+
+      const text = await resp.text();
+      if (!text || !text.trim()) {
+        warn(
+          "ensureSubjectVisitLoaded: empty response body for visit",
+          subjectVisitId
+        );
+        return null;
+      }
+
+      const json = safeJsonParse(text);
+      if (!json || !json.data) {
+        warn("ensureSubjectVisitLoaded: no data in JSON for visit", subjectVisitId);
+        return null;
+      }
+
       onSubjectVisitResponse(subjectVisitId, json.data);
       return subjectVisitCache.get(subjectVisitId) || null;
     } catch (e) {
@@ -420,7 +459,29 @@
             credentials: "include",
           }
         );
-        const json = await resp.json();
+
+        if (!resp.ok) {
+          warn(
+            "Failed to load SubjectForm",
+            subjectFormId,
+            "status",
+            resp.status
+          );
+          continue;
+        }
+
+        const text = await resp.text();
+        if (!text || !text.trim()) {
+          warn("Empty SubjectForm body", subjectFormId);
+          continue;
+        }
+
+        const json = safeJsonParse(text);
+        if (!json) {
+          warn("Invalid JSON in SubjectForm", subjectFormId);
+          continue;
+        }
+
         const values = extractVsValuesFromSubjectForm(json);
 
         for (const v of values) {
