@@ -77,6 +77,33 @@
   };
 
   // ----------------------------
+  // Авторизационные заголовки
+  // ----------------------------
+
+  // Сюда складываем последние авторизационные заголовки, которые видел XHR
+  const apiAuthHeaders = {};
+
+  function getApiAuthHeaders() {
+    // можно фильтровать, но пока оставим как есть
+    return { ...apiAuthHeaders };
+  }
+
+  function updateApiAuthHeadersFromObject(headersObj) {
+    if (!headersObj) return;
+    for (const [name, value] of Object.entries(headersObj)) {
+      if (!value) continue;
+      const lower = name.toLowerCase();
+      if (
+        lower === "authorization" ||
+        lower === "x-xsrf-token" ||
+        lower === "x-csrf-token"
+      ) {
+        apiAuthHeaders[name] = value;
+      }
+    }
+  }
+
+  // ----------------------------
   // Кэш и ensure*-функции
   // ----------------------------
 
@@ -118,7 +145,6 @@
         : [],
     });
 
-    // Связываем визит с субъектом, НО НЕ трогаем subjectCache
     const subject = data.subject || {};
     if (subject.id) {
       subjectByVisit.set(subjectVisitId, subject.id);
@@ -132,7 +158,7 @@
     );
   }
 
-  // ---- ИСПРАВЛЕНО: устойчивый парсинг JSON для Subject ----
+  // ---- Устойчивый fetch + Authorization для Subject ----
   async function ensureSubjectLoaded(subjectId, baseUrl) {
     if (!subjectId) return null;
 
@@ -150,6 +176,7 @@
       log("ensureSubjectLoaded: fetching /api/Subjects/", subjectId);
       const resp = await fetch(`${baseUrl}/api/Subjects/${subjectId}`, {
         credentials: "include",
+        headers: getApiAuthHeaders(),
       });
 
       if (!resp.ok) {
@@ -184,7 +211,7 @@
     }
   }
 
-  // ---- ИСПРАВЛЕНО: устойчивый парсинг JSON для SubjectVisit ----
+  // ---- Устойчивый fetch + Authorization для SubjectVisit ----
   async function ensureSubjectVisitLoaded(subjectVisitId, baseUrl) {
     if (!subjectVisitId) return null;
     if (subjectVisitCache.has(subjectVisitId)) {
@@ -200,6 +227,7 @@
         `${baseUrl}/api/SubjectsVisit/${subjectVisitId}`,
         {
           credentials: "include",
+          headers: getApiAuthHeaders(),
         }
       );
 
@@ -225,7 +253,10 @@
 
       const json = safeJsonParse(text);
       if (!json || !json.data) {
-        warn("ensureSubjectVisitLoaded: no data in JSON for visit", subjectVisitId);
+        warn(
+          "ensureSubjectVisitLoaded: no data in JSON for visit",
+          subjectVisitId
+        );
         return null;
       }
 
@@ -457,6 +488,7 @@
           `${baseUrl}/api/SubjectsForm/${subjectFormId}`,
           {
             credentials: "include",
+            headers: getApiAuthHeaders(),
           }
         );
 
@@ -673,25 +705,43 @@
   }
 
   // ----------------------------------------------------
-  // XHR перехват
+  // XHR перехват + вытаскивание Authorization
   // ----------------------------------------------------
 
   (function patchXHR() {
     const origOpen = XMLHttpRequest.prototype.open;
     const origSend = XMLHttpRequest.prototype.send;
+    const origSetRequestHeader =
+      XMLHttpRequest.prototype.setRequestHeader;
 
     XMLHttpRequest.prototype.open = function (method, url) {
       this.__vsHelper = this.__vsHelper || {};
       this.__vsHelper.method = method;
       this.__vsHelper.url = url;
+      this.__vsHelper.headers = this.__vsHelper.headers || {};
       return origOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.setRequestHeader = function (header, value) {
+      if (!this.__vsHelper) this.__vsHelper = {};
+      if (!this.__vsHelper.headers) this.__vsHelper.headers = {};
+      this.__vsHelper.headers[header] = value;
+
+      // обновляем глобальные auth-заголовки
+      updateApiAuthHeadersFromObject({ [header]: value });
+
+      return origSetRequestHeader.apply(this, arguments);
     };
 
     XMLHttpRequest.prototype.send = function (body) {
       if (this.__vsHelper) {
         this.addEventListener("load", () => {
           try {
-            handleXhrLoad(this.__vsHelper.method, this.__vsHelper.url, this);
+            handleXhrLoad(
+              this.__vsHelper.method,
+              this.__vsHelper.url,
+              this
+            );
           } catch (e) {
             error("handleXhrLoad failed", e);
           }
@@ -705,6 +755,12 @@
 
   function handleXhrLoad(method, url, xhr) {
     if (!url || xhr.status < 200 || xhr.status >= 300) return;
+
+    // На всякий случай обновим auth из заголовков этого запроса
+    const helper = xhr.__vsHelper || {};
+    if (helper.headers) {
+      updateApiAuthHeadersFromObject(helper.headers);
+    }
 
     let fullUrl;
     try {
@@ -746,8 +802,6 @@
       scheduleInjection();
       return;
     }
-
-    // /api/SubjectsForm/{id} пока не используем из перехвата
   }
 
   // -----------------------------------------------------
